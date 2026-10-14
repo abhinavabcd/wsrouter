@@ -161,7 +161,7 @@ func TestHTTPSWSSAndCertificateReload(t *testing.T) {
 			t.Fatal(err)
 		}
 		status, err := decodePacket(statusData)
-		if err != nil || status.Type != "status" || status.Payload != "sent" || status.PacketID != delivered.PacketID {
+		if err != nil || status.Type != "status" || status.Payload != "success" || status.PacketID != delivered.PacketID {
 			t.Fatalf("WSS status: %+v, %v", status, err)
 		}
 	}

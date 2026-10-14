@@ -155,10 +155,14 @@ func (link *peerLink) readLoop() {
 			return
 		}
 		var frame peerFrame
-		if json.Unmarshal(data, &frame) != nil || frame.Packet.Dest == "" || len(frame.Packet.Dests) != 0 || frame.Packet.Src == "" || frame.Packet.Type == "" || frame.Packet.Type == "reconnect" || frame.Hops >= 4 {
+		if json.Unmarshal(data, &frame) != nil || frame.Packet.Dest == "" || len(frame.Packet.Dests) != 0 || frame.Packet.sourceNodeID() == "" || frame.Packet.Type == "" || frame.Packet.Type == "reconnect" || frame.Hops >= 4 {
 			return
 		}
 		p := frame.Packet
+		if p.Timestamp == nil {
+			now := time.Now().UnixMilli()
+			p.Timestamp = &now
+		}
 		p.hops = frame.Hops + 1
 		p.replays = frame.Replays
 		link.mu.Lock()

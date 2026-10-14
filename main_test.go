@@ -159,6 +159,83 @@ func TestJSONAndToken(t *testing.T) {
 	}
 }
 
+func TestMessageTimestampAcrossServers(t *testing.T) {
+	servers, urls := startCluster(t, 2)
+	source := createNode(t, urls[0].URL, "source")
+	sourceOwner, _ := servers[0].owner(source.id)
+	var dest testNode
+	var destOwner peer
+	for i := 0; i < 100; i++ {
+		dest = createNode(t, urls[0].URL, "dest")
+		destOwner, _ = servers[0].owner(dest.id)
+		if destOwner.ID != sourceOwner.ID {
+			break
+		}
+	}
+	if destOwner.ID == sourceOwner.ID {
+		t.Fatal("could not place destination on another server")
+	}
+	c, err := servers[0].verifyToken(source.token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.NodeType = "server"
+	serverToken, err := servers[0].signToken(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeConn := connectNode(t, sourceOwner.Addr, source.token, "")
+	serverConn := connectNode(t, sourceOwner.Addr, serverToken, "")
+	destConn := connectNode(t, destOwner.Addr, dest.token, "")
+	for _, s := range servers {
+		if s.id == sourceOwner.ID {
+			waitConnections(t, s, source.id, 2)
+		} else {
+			waitConnections(t, s, dest.id, 1)
+		}
+	}
+	for _, nodeType := range []string{"node", "server"} {
+		for _, supplied := range []string{"missing", "zero", "existing"} {
+			t.Run(nodeType+"/"+supplied, func(t *testing.T) {
+				p := packet{PacketID: nodeType + "-" + supplied, Type: "data", Dest: dest.id, Payload: "hello"}
+				if supplied != "missing" {
+					value := int64(0)
+					if supplied == "existing" {
+						value = 1700000000123
+					}
+					p.Timestamp = &value
+				}
+				conn := nodeConn
+				if nodeType == "server" {
+					conn = serverConn
+					p.Src, p.XSrc = source.id, "source"
+				}
+				data, _ := encodePacket(p)
+				before := time.Now().UnixMilli()
+				if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+					t.Fatal(err)
+				}
+				destConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+				_, raw, err := destConn.ReadMessage()
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := decodePacket(raw)
+				if err != nil || got.Timestamp == nil || got.PacketID != p.PacketID {
+					t.Fatalf("missing timestamp or wrong packet: %+v, %v", got, err)
+				}
+				if nodeType == "server" && p.Timestamp != nil {
+					if *got.Timestamp != *p.Timestamp {
+						t.Fatalf("server timestamp changed: got %d, want %d", *got.Timestamp, *p.Timestamp)
+					}
+				} else if *got.Timestamp < before || *got.Timestamp > time.Now().UnixMilli() {
+					t.Fatalf("timestamp %d is not the server's receive time", *got.Timestamp)
+				}
+			})
+		}
+	}
+}
+
 func TestTwoServerRoutingKeysAndCORS(t *testing.T) {
 	servers, httpServers := startCluster(t, 2)
 	leader, follower := servers[0], servers[1]
@@ -238,7 +315,7 @@ func TestTwoServerRoutingKeysAndCORS(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := decodePacket(received)
-	if err != nil || got.Src != source.id || got.XSrc != "source-account" || got.Dest != dest.id || got.Type != "data" || got.Payload != base64.StdEncoding.EncodeToString([]byte{0, 1, 255}) {
+	if err != nil || got.Src != source.id || got.SrcNodeID != source.id || got.XSrc != "source-account" || got.Dest != dest.id || got.Type != "data" || got.Payload != base64.StdEncoding.EncodeToString([]byte{0, 1, 255}) {
 		t.Fatalf("wrong forwarded packet: %+v, %v", got, err)
 	}
 	dst2.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -255,7 +332,7 @@ func TestTwoServerRoutingKeysAndCORS(t *testing.T) {
 		t.Fatal(err)
 	}
 	sent, err := decodePacket(statusData)
-	if err != nil || sent.Type != "status" || sent.Payload != "sent" || sent.PacketID == "" || sent.PacketID != got.PacketID || sent.Src != dest.id || sent.Dest != source.id {
+	if err != nil || sent.Type != "status" || sent.Payload != "success" || sent.PacketID == "" || sent.PacketID != got.PacketID || sent.Src != dest.id || sent.SrcNodeID != dest.id || sent.Dest != source.id {
 		t.Fatalf("wrong sent status: %+v, %v", sent, err)
 	}
 
@@ -277,7 +354,7 @@ func TestTwoServerRoutingKeysAndCORS(t *testing.T) {
 		t.Fatal(err)
 	}
 	localStatus, err := decodePacket(localStatusData)
-	if err != nil || localStatus.Type != "status" || localStatus.Payload != "sent" || localStatus.PacketID != localPacket.PacketID {
+	if err != nil || localStatus.Type != "status" || localStatus.Payload != "success" || localStatus.PacketID != localPacket.PacketID {
 		t.Fatalf("wrong local status: %+v, %v", localStatus, err)
 	}
 
@@ -294,7 +371,15 @@ func TestTwoServerRoutingKeysAndCORS(t *testing.T) {
 func TestRenewOnDifferentServer(t *testing.T) {
 	servers, urls := startCluster(t, 2)
 	node := createNode(t, urls[0].URL, "account")
-	req, _ := http.NewRequest(http.MethodPost, urls[1].URL+"/renew", nil)
+	owner, _ := servers[0].owner(node.id)
+	ownerIndex := 0
+	if owner.ID == servers[1].id {
+		ownerIndex = 1
+	}
+	first := connectNode(t, owner.Addr, node.token, "")
+	second := connectNode(t, owner.Addr, node.token, "")
+	waitConnections(t, servers[ownerIndex], node.id, 2)
+	req, _ := http.NewRequest(http.MethodPost, urls[1-ownerIndex].URL+"/renew", strings.NewReader(`{"valid_for":321}`))
 	req.Header.Set("Authorization", "Bearer "+node.token)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -312,8 +397,32 @@ func TestRenewOnDifferentServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, err := servers[0].verifyToken(renewed.Token)
-	if err != nil || c.NodeID != node.id || c.XSrcID != "account" || c.Issuer != servers[1].id {
+	if err != nil || c.NodeID != node.id || c.XSrcID != "account" || c.Issuer != owner.ID || c.Nonce == "" || renewed.Token == node.token || c.Expires < time.Now().Unix()+319 || c.Expires > time.Now().Unix()+321 {
 		t.Fatalf("wrong renewed claims: %+v, %v", c, err)
+	}
+	for _, conn := range []*websocket.Conn{first, second} {
+		conn.SetReadDeadline(time.Now().Add(time.Second))
+		if _, _, err := conn.ReadMessage(); err == nil || os.IsTimeout(err) {
+			t.Fatalf("renew did not disconnect an existing socket: %v", err)
+		}
+	}
+	if servers[ownerIndex].nodeCount.Load() != 0 {
+		t.Fatal("disconnected node remains counted")
+	}
+	newConn := connectNode(t, owner.Addr, renewed.Token, "")
+	waitConnections(t, servers[ownerIndex], node.id, 1)
+	data, _ := encodePacket(packet{Type: "data", Dest: node.id, Payload: "reconnected"})
+	if err := newConn.WriteMessage(websocket.TextMessage, data); err != nil {
+		t.Fatal(err)
+	}
+	newConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, raw, err := newConn.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivered, err := decodePacket(raw)
+	if err != nil || delivered.Payload != "reconnected" || delivered.SrcNodeID != node.id {
+		t.Fatalf("renewed token did not reconnect: %+v, %v", delivered, err)
 	}
 }
 
@@ -425,8 +534,8 @@ func TestStressFiveServers(t *testing.T) {
 					return
 				}
 				p, err := decodePacket(data)
-				other, exists := idIndex[p.Src]
-				if err != nil || kind != websocket.TextMessage || !exists || other == i || p.Dest != ids[i] || p.PacketID == "" {
+				other, exists := idIndex[p.SrcNodeID]
+				if err != nil || kind != websocket.TextMessage || !exists || p.SrcNodeID != p.Src || other == i || p.Dest != ids[i] || p.PacketID == "" {
 					fail(fmt.Errorf("node %d invalid packet after %d: %+v, %v", i, received, p, err))
 					return
 				}
@@ -442,7 +551,7 @@ func TestStressFiveServers(t *testing.T) {
 						received++
 					}
 				case "status":
-					if p.Payload != "sent" || (seenStatus[other] != "" && seenStatus[other] != p.PacketID) {
+					if p.Payload != "success" || (seenStatus[other] != "" && seenStatus[other] != p.PacketID) {
 						fail(fmt.Errorf("node %d invalid status for %d: %+v", i, other, p))
 						return
 					}
@@ -510,7 +619,7 @@ func TestStressFiveServers(t *testing.T) {
 			for _, s := range servers {
 				s.cleanupReceipts(time.Now().Add(31 * time.Second))
 			}
-			t.Logf("delivered %d data packets and %d sent statuses across five servers in %s", receivedData.Load(), receivedStatus.Load(), elapsed)
+			t.Logf("delivered %d data packets and %d success statuses across five servers in %s", receivedData.Load(), receivedStatus.Load(), elapsed)
 			return
 		case <-ticker.C:
 			var routes, statuses uint64
@@ -568,7 +677,7 @@ func TestJoinBroadcastsKeyBeforeForwarding(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := decodePacket(received)
-	if err != nil || got.Src != source.id || got.XSrc != "new-account" || got.Payload != "immediate" {
+	if err != nil || got.Src != source.id || got.SrcNodeID != source.id || got.XSrc != "new-account" || got.Payload != "immediate" {
 		t.Fatalf("wrong packet after join: %+v, %v", got, err)
 	}
 	srcConn.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -577,7 +686,7 @@ func TestJoinBroadcastsKeyBeforeForwarding(t *testing.T) {
 		t.Fatal(err)
 	}
 	sent, err := decodePacket(statusData)
-	if err != nil || sent.Type != "status" || sent.Payload != "sent" || sent.PacketID != got.PacketID {
+	if err != nil || sent.Type != "status" || sent.Payload != "success" || sent.PacketID != got.PacketID {
 		t.Fatalf("wrong join status: %+v, %v", sent, err)
 	}
 }
@@ -611,7 +720,7 @@ func TestFailedStatusAfterLastConnectionDrops(t *testing.T) {
 		t.Fatal(err)
 	}
 	sent, err := decodePacket(sentData)
-	if err != nil || sent.Type != "status" || sent.Payload != "sent" || sent.PacketID == "" {
+	if err != nil || sent.Type != "status" || sent.Payload != "success" || sent.PacketID == "" {
 		t.Fatalf("wrong sent status: %+v, %v", sent, err)
 	}
 	if err := first.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second)); err != nil {
@@ -654,7 +763,7 @@ func TestFailedStatusAfterLastConnectionDrops(t *testing.T) {
 		t.Fatal(err)
 	}
 	failed, err := decodePacket(failedData)
-	if err != nil || failed.Type != "status" || failed.Payload != "failed" || failed.PacketID != sent.PacketID || failed.Src != dest.id || failed.Dest != source.id {
+	if err != nil || failed.Type != "status" || failed.Payload != "failed" || failed.PacketID != sent.PacketID || failed.Src != dest.id || failed.SrcNodeID != dest.id || failed.Dest != source.id {
 		t.Fatalf("wrong failed status: %+v, %v", failed, err)
 	}
 	srcConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
@@ -709,7 +818,7 @@ func TestDisconnectReroutesToNewOwnerBeforeFeedback(t *testing.T) {
 		t.Fatal(err)
 	}
 	replayed, err := decodePacket(replayData)
-	if err != nil || replayed.PacketID != "migrating-message" || replayed.Src != source.id || replayed.Dest != dest.id || replayed.Payload != "retry" {
+	if err != nil || replayed.PacketID != "migrating-message" || replayed.Src != source.id || replayed.SrcNodeID != source.id || replayed.Dest != dest.id || replayed.Payload != "retry" {
 		t.Fatalf("wrong migrated replay: %+v, %v", replayed, err)
 	}
 	srcConn.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -718,7 +827,7 @@ func TestDisconnectReroutesToNewOwnerBeforeFeedback(t *testing.T) {
 		t.Fatal(err)
 	}
 	feedback, err := decodePacket(feedbackData)
-	if err != nil || feedback.Type != "status" || feedback.Payload != "sent" || feedback.PacketID != "migrating-message" {
+	if err != nil || feedback.Type != "status" || feedback.Payload != "success" || feedback.PacketID != "migrating-message" {
 		t.Fatalf("disconnect failed before rerouting: %+v, %v", feedback, err)
 	}
 }
@@ -738,7 +847,7 @@ func TestOfflineDestinationGetsFailedStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	status, err := decodePacket(statusData)
-	if err != nil || status.Type != "status" || status.Payload != "failed" || status.PacketID != "offline-message" || status.Src != dest.id || status.Dest != source.id {
+	if err != nil || status.Type != "status" || status.Payload != "failed" || status.PacketID != "offline-message" || status.Src != dest.id || status.SrcNodeID != dest.id || status.Dest != source.id {
 		t.Fatalf("wrong offline status: %+v, %v", status, err)
 	}
 }
@@ -906,7 +1015,14 @@ func TestCreateTokenLifetimeAndServerRouting(t *testing.T) {
 	sourceConn := connectNode(t, ownerURL(defaultNode.id), defaultNode.token, "")
 	destConn := connectNode(t, ownerURL(dest.id), dest.token, "")
 	serverConn := connectNode(t, ownerURL(serverNode.id), serverNode.token, "")
-	data, _ := encodePacket(packet{PacketID: "server-owned-1", Type: "data", Dest: dest.id, Src: defaultNode.id, XSrc: "delegated-account", Payload: "hello"})
+	for _, node := range []testNode{defaultNode, dest, serverNode} {
+		for _, s := range servers {
+			if s.addr == ownerURL(node.id) {
+				waitConnections(t, s, node.id, 1)
+			}
+		}
+	}
+	data, _ := encodePacket(packet{PacketID: "server-owned-1", Type: "data", Dest: dest.id, SrcNodeID: defaultNode.id, XSrc: "delegated-account", Payload: "hello"})
 	if err := serverConn.WriteMessage(websocket.TextMessage, data); err != nil {
 		t.Fatal(err)
 	}
@@ -916,7 +1032,7 @@ func TestCreateTokenLifetimeAndServerRouting(t *testing.T) {
 		t.Fatal(err)
 	}
 	delivered, err := decodePacket(deliveredData)
-	if err != nil || delivered.PacketID != "server-owned-1" || delivered.Src != defaultNode.id || delivered.XSrc != "delegated-account" || delivered.Dest != dest.id {
+	if err != nil || delivered.PacketID != "server-owned-1" || delivered.Src != "" || delivered.SrcNodeID != defaultNode.id || delivered.XSrc != "delegated-account" || delivered.Dest != dest.id {
 		t.Fatalf("server packet was changed: %+v, %v", delivered, err)
 	}
 	sourceConn.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -925,10 +1041,10 @@ func TestCreateTokenLifetimeAndServerRouting(t *testing.T) {
 		t.Fatal(err)
 	}
 	status, err := decodePacket(statusData)
-	if err != nil || status.PacketID != "server-owned-1" || status.Type != "status" || status.Payload != "sent" || status.Dest != defaultNode.id {
+	if err != nil || status.PacketID != "server-owned-1" || status.Type != "status" || status.Payload != "success" || status.Dest != defaultNode.id || status.SrcNodeID != dest.id {
 		t.Fatalf("wrong delegated status: %+v, %v", status, err)
 	}
-	manual, _ := encodePacket(packet{PacketID: "manual-status", Type: "status", Dest: dest.id, Src: defaultNode.id, XSrc: "delegated-account", Payload: "custom"})
+	manual, _ := encodePacket(packet{PacketID: "manual-status", Type: "status", Dest: dest.id, Src: defaultNode.id, SrcNodeID: "preserved-node", XSrc: "delegated-account", Payload: "custom"})
 	if err := serverConn.WriteMessage(websocket.TextMessage, manual); err != nil {
 		t.Fatal(err)
 	}
@@ -938,7 +1054,7 @@ func TestCreateTokenLifetimeAndServerRouting(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := decodePacket(manualData)
-	if err != nil || got.PacketID != "manual-status" || got.Type != "status" || got.Src != defaultNode.id || got.XSrc != "delegated-account" || got.Payload != "custom" {
+	if err != nil || got.PacketID != "manual-status" || got.Type != "status" || got.Src != defaultNode.id || got.SrcNodeID != "preserved-node" || got.XSrc != "delegated-account" || got.Payload != "custom" {
 		t.Fatalf("server status was changed: %+v, %v", got, err)
 	}
 }
@@ -1052,7 +1168,7 @@ func TestMultipleDestinationsAcrossServers(t *testing.T) {
 			t.Fatal(err)
 		}
 		got, err := decodePacket(deliveredData)
-		if err != nil || got.Type != "data" || got.Dest != target.id || len(got.Dests) != 0 || got.Src != source.id || got.XSrc != "source" || got.Payload != "fanout" || got.PacketID == "" {
+		if err != nil || got.Type != "data" || got.Dest != target.id || len(got.Dests) != 0 || got.Src != source.id || got.SrcNodeID != source.id || got.XSrc != "source" || got.Payload != "fanout" || got.PacketID == "" {
 			t.Fatalf("bad fanout delivery: %+v, %v", got, err)
 		}
 		if packetID != "" && got.PacketID != packetID {
@@ -1068,11 +1184,11 @@ func TestMultipleDestinationsAcrossServers(t *testing.T) {
 			t.Fatal(err)
 		}
 		status, err := decodePacket(statusData)
-		wantPayload := "sent"
+		wantPayload := "success"
 		if status.Src == offline.id {
 			wantPayload = "failed"
 		}
-		if err != nil || status.Type != "status" || status.PacketID != packetID || status.Dest != source.id || status.Payload != wantPayload || seen[status.Src] || (status.Src != local.id && status.Src != remote.id && status.Src != offline.id) {
+		if err != nil || status.Type != "status" || status.SrcNodeID != status.Src || status.PacketID != packetID || status.Dest != source.id || status.Payload != wantPayload || seen[status.Src] || (status.Src != local.id && status.Src != remote.id && status.Src != offline.id) {
 			t.Fatalf("bad fanout status: %+v, %v", status, err)
 		}
 		seen[status.Src] = true
@@ -1116,15 +1232,22 @@ func TestAutomaticSocketCloseReplaysRecentPacket(t *testing.T) {
 	second := connectNode(t, urls[0].URL, dest.token, "")
 	waitConnections(t, servers[0], source.id, 1)
 	waitConnections(t, servers[0], dest.id, 2)
-	data, _ := encodePacket(packet{PacketID: "client-chosen", Type: "data", Dest: dest.id, Payload: "replay"})
+	data, _ := encodePacket(packet{PacketID: "client-chosen", Type: "data", SrcNodeID: "spoofed-node", Dest: dest.id, Payload: "replay"})
 	if err := srcConn.WriteMessage(websocket.TextMessage, data); err != nil {
 		t.Fatal(err)
 	}
+	var originalTimestamp int64
 	for _, conn := range []*websocket.Conn{first, second} {
 		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-		if _, _, err := conn.ReadMessage(); err != nil {
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
 			t.Fatal(err)
 		}
+		got, err := decodePacket(raw)
+		if err != nil || got.Timestamp == nil {
+			t.Fatalf("missing original timestamp: %+v, %v", got, err)
+		}
+		originalTimestamp = *got.Timestamp
 	}
 	srcConn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	_, initialStatusData, err := srcConn.ReadMessage()
@@ -1132,7 +1255,7 @@ func TestAutomaticSocketCloseReplaysRecentPacket(t *testing.T) {
 		t.Fatal(err)
 	}
 	initialStatus, err := decodePacket(initialStatusData)
-	if err != nil || initialStatus.Type != "status" || initialStatus.Payload != "sent" || initialStatus.PacketID != "client-chosen" {
+	if err != nil || initialStatus.Type != "status" || initialStatus.Payload != "success" || initialStatus.PacketID != "client-chosen" {
 		t.Fatalf("initial status: %+v, %v", initialStatus, err)
 	}
 	first.Close() // Abrupt close: the server must replay packets queued toward this socket.
@@ -1142,7 +1265,7 @@ func TestAutomaticSocketCloseReplaysRecentPacket(t *testing.T) {
 		t.Fatal(err)
 	}
 	replayed, err := decodePacket(replayData)
-	if err != nil || replayed.Type != "data" || replayed.PacketID != initialStatus.PacketID || replayed.Src != source.id || replayed.Dest != dest.id || replayed.Payload != "replay" {
+	if err != nil || replayed.Type != "data" || replayed.PacketID != initialStatus.PacketID || replayed.Src != source.id || replayed.SrcNodeID != source.id || replayed.Dest != dest.id || replayed.Payload != "replay" || replayed.Timestamp == nil || *replayed.Timestamp != originalTimestamp {
 		t.Fatalf("replayed packet: %+v, %v", replayed, err)
 	}
 	srcConn.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -1151,7 +1274,7 @@ func TestAutomaticSocketCloseReplaysRecentPacket(t *testing.T) {
 		t.Fatal(err)
 	}
 	replayStatus, err := decodePacket(replayStatusData)
-	if err != nil || replayStatus.Type != "status" || replayStatus.Payload != "sent" || replayStatus.PacketID != replayed.PacketID {
+	if err != nil || replayStatus.Type != "status" || replayStatus.Payload != "success" || replayStatus.PacketID != replayed.PacketID {
 		t.Fatalf("replay status: %+v, %v", replayStatus, err)
 	}
 }
@@ -1242,7 +1365,7 @@ func TestPeerWebSocketReusesLinkAndReplaysOnClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	replayed, err := decodePacket(replayRaw)
-	if err != nil || replayed.Type != "data" || replayed.Src != source.id || replayed.Dest != dest.id || (replayed.PacketID != "chosen-1" && replayed.PacketID != "chosen-2") {
+	if err != nil || replayed.Type != "data" || replayed.Src != source.id || replayed.SrcNodeID != source.id || replayed.Dest != dest.id || (replayed.PacketID != "chosen-1" && replayed.PacketID != "chosen-2") {
 		t.Fatalf("peer replay changed packet identity: %+v, %v", replayed, err)
 	}
 }

@@ -18,6 +18,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -50,27 +51,38 @@ type member struct {
 }
 
 type claims struct {
-	Issuer   uint64 `json:"issuer"`
-	NodeID   string `json:"node_id"`
-	XSrcID   string `json:"x_src_id"`
-	NodeType string `json:"node_type,omitempty"`
-	Expires  int64  `json:"expires"`
+	Issuer        uint64 `json:"issuer"`
+	NodeID        string `json:"node_id"`
+	XSrcID        string `json:"x_src_id"`
+	NodeType      string `json:"node_type,omitempty"`
+	AuthVerifyURL string `json:"auth_verify_url,omitempty"`
+	Nonce         string `json:"nonce,omitempty"`
+	Expires       int64  `json:"expires"`
 }
 
 type packet struct {
-	PacketID string   `json:"_id,omitempty"`
-	Type     string   `json:"type"`
-	Dest     string   `json:"dest_node_id,omitempty"`
-	Dests    []string `json:"dest_node_ids,omitempty"`
-	Src      string   `json:"src_id,omitempty"`
-	XSrc     string   `json:"x_src_id,omitempty"`
-	Payload  string   `json:"payload"`
-	hops     uint8
-	replays  uint8
+	PacketID  string   `json:"_id,omitempty"`
+	Timestamp *int64   `json:"timestamp,omitempty"`
+	Type      string   `json:"type"`
+	Dest      string   `json:"dest_node_id,omitempty"`
+	Dests     []string `json:"dest_node_ids,omitempty"`
+	Src       string   `json:"src_id,omitempty"`
+	SrcNodeID string   `json:"src_node_id"`
+	XSrc      string   `json:"x_src_id,omitempty"`
+	Payload   string   `json:"payload"`
+	hops      uint8
+	replays   uint8
 }
 type replayRecord struct {
 	packet packet
 	sentAt time.Time
+}
+
+func (p packet) sourceNodeID() string {
+	if p.SrcNodeID != "" {
+		return p.SrcNodeID
+	}
+	return p.Src
 }
 
 type receipt struct {
@@ -367,11 +379,12 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST required", http.StatusMethodNotAllowed)
 		return
 	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1024))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4096))
 	var req struct {
-		XSrcID   string `json:"x_src_id"`
-		NodeType string `json:"node_type"`
-		ValidFor *int64 `json:"valid_for"`
+		XSrcID        string `json:"x_src_id"`
+		NodeType      string `json:"node_type"`
+		ValidFor      *int64 `json:"valid_for"`
+		AuthVerifyURL string `json:"auth_verify_url"`
 	}
 	if err != nil || json.Unmarshal(body, &req) != nil || len(req.XSrcID) == 0 || len(req.XSrcID) > 256 || (req.NodeType != "" && req.NodeType != "node" && req.NodeType != "server") {
 		http.Error(w, "invalid x_src_id or node_type", http.StatusBadRequest)
@@ -380,6 +393,12 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) {
 	if req.NodeType == "server" && !verifyBody(body, r.Header.Get("X-Cluster-Signature"), s.serverSecret) {
 		http.Error(w, "server node requires a cluster signature", http.StatusUnauthorized)
 		return
+	}
+	if req.AuthVerifyURL != "" {
+		if _, err := parseVerifyURL(req.AuthVerifyURL); err != nil {
+			http.Error(w, "invalid auth_verify_url", http.StatusBadRequest)
+			return
+		}
 	}
 	expires, err := tokenExpiry(req.ValidFor)
 	if err != nil {
@@ -394,7 +413,7 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) {
 	if req.NodeType == "" {
 		req.NodeType = "node"
 	}
-	c := claims{Issuer: s.id, NodeID: hex.EncodeToString(id), XSrcID: req.XSrcID, NodeType: req.NodeType, Expires: expires}
+	c := claims{Issuer: s.id, NodeID: hex.EncodeToString(id), XSrcID: req.XSrcID, NodeType: req.NodeType, Expires: expires, AuthVerifyURL: req.AuthVerifyURL}
 	token, err := s.signToken(c)
 	if err != nil {
 		http.Error(w, "token creation failed", http.StatusInternalServerError)
@@ -418,9 +437,39 @@ func (s *server) renew(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bearer token required", http.StatusUnauthorized)
 		return
 	}
-	c, err := s.verifyToken(strings.TrimPrefix(authorization, "Bearer "))
-	if err != nil {
+	c, err := s.verifyTokenSignature(strings.TrimPrefix(authorization, "Bearer "))
+	if err != nil || (c.Expires <= time.Now().Unix() && c.AuthVerifyURL == "") {
 		http.Error(w, "invalid token", http.StatusUnauthorized)
+		return
+	}
+	owner, ok := s.owner(c.NodeID)
+	if !ok {
+		http.Error(w, "ring unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if owner.Addr != s.addr {
+		hops := 0
+		if raw := r.Header.Get("X-Renew-Hops"); raw != "" {
+			hops, err = strconv.Atoi(raw)
+		}
+		if err != nil || hops < 0 || hops >= 4 {
+			http.Error(w, "renewal forwarding exceeded four hops", http.StatusLoopDetected)
+			return
+		}
+		target, err := url.Parse(owner.Addr)
+		if err != nil {
+			http.Error(w, "invalid owner address", http.StatusBadGateway)
+			return
+		}
+		proxy := httputil.NewSingleHostReverseProxy(target)
+		proxy.Transport = s.httpClient.Transport
+		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+			http.Error(w, "node owner unavailable", http.StatusBadGateway)
+		}
+		r.Header.Set("X-Renew-Hops", strconv.Itoa(hops+1))
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		proxy.ServeHTTP(w, r.WithContext(ctx))
 		return
 	}
 	var req struct {
@@ -435,6 +484,16 @@ func (s *server) renew(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := s.verifyAuthorization(r.Context(), c.AuthVerifyURL, "renew"); err != nil {
+		http.Error(w, "authorization denied", http.StatusUnauthorized)
+		return
+	}
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		http.Error(w, "random source failed", http.StatusInternalServerError)
+		return
+	}
+	c.Nonce = hex.EncodeToString(nonce)
 	c.Issuer = s.id
 	c.Expires = expires
 	token, err := s.signToken(c)
@@ -442,8 +501,33 @@ func (s *server) renew(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "token creation failed", http.StatusInternalServerError)
 		return
 	}
+	s.disconnectNode(c.NodeID)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"node_id": c.NodeID, "node_type": c.NodeType, "token": token, "expires": c.Expires})
+}
+
+func (s *server) disconnectNode(nodeID string) {
+	var connections []*client
+	s.mu.Lock()
+	if state := s.nodes[nodeID]; state != nil {
+		state.mu.Lock()
+		for cl := range state.connections {
+			cl.normalClose.Store(true)
+			connections = append(connections, cl)
+		}
+		delete(s.nodes, nodeID)
+		s.nodeCount.Add(-1)
+		state.mu.Unlock()
+	}
+	s.mu.Unlock()
+	// Remove all sockets from delivery before closing any one of them. Close
+	// every transport before receipt cleanup, which can route feedback remotely.
+	for _, cl := range connections {
+		cl.conn.Close()
+	}
+	for _, cl := range connections {
+		cl.close()
+	}
 }
 
 func (s *server) locate(w http.ResponseWriter, r *http.Request) {
@@ -458,6 +542,10 @@ func (s *server) locate(w http.ResponseWriter, r *http.Request) {
 	c, err := s.verifyToken(token)
 	if err != nil {
 		http.Error(w, "invalid token", http.StatusUnauthorized)
+		return
+	}
+	if err := s.verifyAuthorization(r.Context(), c.AuthVerifyURL, ""); err != nil {
+		http.Error(w, "authorization denied", http.StatusUnauthorized)
 		return
 	}
 	owner, ok := s.owner(c.NodeID)
@@ -492,6 +580,10 @@ func (s *server) connect(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusMisdirectedRequest)
 		json.NewEncoder(w).Encode(map[string]string{"address": owner.Addr})
+		return
+	}
+	if err := s.verifyAuthorization(r.Context(), c.AuthVerifyURL, ""); err != nil {
+		http.Error(w, "authorization denied", http.StatusUnauthorized)
 		return
 	}
 	keepAlive := s.keepAlive
@@ -775,6 +867,10 @@ func ownerIn(ring []peer, nodeID string) peer {
 }
 
 func (s *server) routePacket(ctx context.Context, p packet) error {
+	if p.Timestamp == nil {
+		now := time.Now().UnixMilli()
+		p.Timestamp = &now
+	}
 	for attempt := 0; attempt < 2; attempt++ {
 		owner, ok := s.owner(p.Dest)
 		if !ok {
@@ -844,7 +940,7 @@ func (s *server) deliver(p packet, data []byte) bool {
 		q := &state.recent
 		q.prune(now)
 		first := len(q.entries) == 0
-		q.entries = append(q.entries, receipt{sourceID: p.Src, packetID: p.PacketID, sentAt: now})
+		q.entries = append(q.entries, receipt{sourceID: p.sourceNodeID(), packetID: p.PacketID, sentAt: now})
 		if first {
 			s.recent.Store(p.Dest, state)
 		}
@@ -858,9 +954,9 @@ func (s *server) deliver(p packet, data []byte) bool {
 }
 
 func (s *server) sendStatus(p packet, delivered bool) {
-	feedback := packet{Type: "status", Dest: p.Src, Src: p.Dest, PacketID: p.PacketID, Payload: "failed"}
+	feedback := packet{Type: "status", Dest: p.sourceNodeID(), Src: p.Dest, SrcNodeID: p.Dest, PacketID: p.PacketID, Payload: "failed"}
 	if delivered {
-		feedback.Payload = "sent"
+		feedback.Payload = "success"
 	}
 	if err := s.routePacket(context.Background(), feedback); err != nil {
 		s.statusErrors.Add(1)
@@ -951,7 +1047,7 @@ func (cl *client) readLoop() {
 			}
 		}
 		if cl.nodeType == "server" {
-			if p.Src == "" {
+			if p.sourceNodeID() == "" {
 				return
 			}
 		} else {
@@ -959,6 +1055,11 @@ func (cl *client) readLoop() {
 				return
 			}
 			p.Src, p.XSrc = cl.nodeID, cl.xSrcID
+			p.SrcNodeID = cl.nodeID
+		}
+		if cl.nodeType != "server" || p.Timestamp == nil {
+			now := time.Now().UnixMilli()
+			p.Timestamp = &now
 		}
 		if p.PacketID == "" {
 			p.PacketID = cl.server.packetPrefix + strconv.FormatUint(cl.server.nextPacketID.Add(1), 36)
@@ -1033,7 +1134,8 @@ func (cl *client) enqueue(msg outbound) {
 }
 
 func (cl *client) reconnect(addr string) {
-	data, _ := encodePacket(packet{Type: "reconnect", Payload: addr})
+	now := time.Now().UnixMilli()
+	data, _ := encodePacket(packet{Type: "reconnect", SrcNodeID: strconv.FormatUint(cl.server.id, 10), Payload: addr, Timestamp: &now})
 	cl.enqueue(outbound{data: data, closeAfter: true})
 }
 
@@ -1056,8 +1158,10 @@ func (cl *client) close() {
 		cl.sentHead = 0
 		s.recentClients.Delete(cl)
 		if len(state.connections) == 0 {
-			delete(s.nodes, cl.nodeID)
-			s.nodeCount.Add(-1)
+			if s.nodes[cl.nodeID] == state {
+				delete(s.nodes, cl.nodeID)
+				s.nodeCount.Add(-1)
+			}
 			state.recent.prune(time.Now())
 			recent = state.recent.entries[state.recent.head:]
 			s.recent.CompareAndDelete(cl.nodeID, state)
@@ -1072,7 +1176,7 @@ func (cl *client) close() {
 		for _, item := range replay {
 			p := item.packet
 			if retried != nil {
-				retried[[2]string{p.Src, p.PacketID}] = struct{}{}
+				retried[[2]string{p.sourceNodeID(), p.PacketID}] = struct{}{}
 			}
 			p.replays++
 			if err := s.routePacket(context.Background(), p); err != nil {
@@ -1108,7 +1212,7 @@ func (cl *client) close() {
 			if _, ok := retried[[2]string{r.sourceID, r.packetID}]; ok {
 				continue
 			}
-			status := packet{Type: "status", Dest: r.sourceID, Src: cl.nodeID, PacketID: r.packetID, Payload: "failed"}
+			status := packet{Type: "status", Dest: r.sourceID, Src: cl.nodeID, SrcNodeID: cl.nodeID, PacketID: r.packetID, Payload: "failed"}
 			if err := s.routePacket(context.Background(), status); err != nil {
 				s.statusErrors.Add(1)
 			}
@@ -1158,8 +1262,19 @@ func (s *server) signToken(c claims) (string, error) {
 }
 
 func (s *server) verifyToken(token string) (claims, error) {
+	c, err := s.verifyTokenSignature(token)
+	if err != nil {
+		return claims{}, err
+	}
+	if c.Expires <= time.Now().Unix() {
+		return claims{}, errors.New("expired token")
+	}
+	return c, nil
+}
+
+func (s *server) verifyTokenSignature(token string) (claims, error) {
 	parts := strings.Split(token, ".")
-	if len(parts) != 2 || len(token) > 2048 {
+	if len(parts) != 2 || len(token) > 8192 {
 		return claims{}, errors.New("invalid token")
 	}
 	data, err := base64.RawURLEncoding.DecodeString(parts[0])
@@ -1167,7 +1282,7 @@ func (s *server) verifyToken(token string) (claims, error) {
 		return claims{}, err
 	}
 	var c claims
-	if json.Unmarshal(data, &c) != nil || len(c.NodeID) != 32 || len(c.XSrcID) == 0 || len(c.XSrcID) > 256 || (c.NodeType != "" && c.NodeType != "node" && c.NodeType != "server") || c.Expires <= time.Now().Unix() {
+	if json.Unmarshal(data, &c) != nil || len(c.NodeID) != 32 || len(c.XSrcID) == 0 || len(c.XSrcID) > 256 || (c.NodeType != "" && c.NodeType != "node" && c.NodeType != "server") || c.Expires <= 0 || len(c.AuthVerifyURL) > 2048 {
 		return claims{}, errors.New("invalid claims")
 	}
 	if _, err := hex.DecodeString(c.NodeID); err != nil {
