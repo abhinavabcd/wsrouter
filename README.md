@@ -1,6 +1,6 @@
 # wsrouter
 
-A Go WebSocket router with a consistent hash ring. Clients have random `node_id` values; servers have fixed ring positions. The first server coordinates membership. Every server generates a fresh 32-byte authentication key at startup and sends it to the first server in its signed heartbeat. The first server includes all active server keys in signed snapshots and pushes a new snapshot to existing servers when membership changes. Snapshot epochs and versions keep concurrent updates in order.
+A Go WebSocket router with a consistent hash ring. All production code lives in `main.go`; tests remain in `*_test.go` files. Clients have random `node_id` values; servers have fixed ring positions. The first server coordinates membership. Every server generates a fresh 32-byte authentication key at startup and sends it to the first server in its signed heartbeat. The first server includes all active server keys in signed snapshots and pushes a new snapshot to existing servers when membership changes. Snapshot epochs and versions keep concurrent updates in order.
 
 ## Run
 
@@ -28,7 +28,7 @@ Pass `--ssl_certs` to serve HTTPS and WSS directly. Set `--addr` to an `https://
 go run . --listen=:8443 --addr=https://localhost:8443 --clusteraddr=https://localhost:8443 --ssl_certs=/path/to/ssl_certs --id=0
 ```
 
-After replacing both certificate files, send a signed `POST /reload` to that server. A successful reload returns HTTP `204` and changes the certificate used for new TLS connections; existing WebSockets stay connected. An invalid pair returns HTTP `500` and leaves the previous certificate in use. The endpoint requires `X-Cluster-Signature`, the hex HMAC-SHA256 of `POST /reload` using `SERVER_SECRET`:
+After replacing both certificate files, send a signed `POST /reload` to that server. A successful reload returns HTTP `204` and changes the certificate used for new TLS connections; existing WebSockets stay connected. An invalid pair returns HTTP `502` and leaves the previous certificate in use. The endpoint requires `X-Cluster-Signature`, the hex HMAC-SHA256 of `POST /reload` using `SERVER_SECRET`:
 
 ```sh
 signature=$(printf 'POST /reload' | openssl dgst -sha256 -hmac "$SERVER_SECRET" | awk '{print $NF}')
@@ -110,6 +110,8 @@ A server hashes the UTF-8 node ID with SHA-256, uses the first 63 bits as a ring
 Packets are limited to 1 MiB. Each client connection has a bounded 4,096-packet send queue and a 1,024-packet routing queue capped at 4 MiB of pending input; clients that overrun either queue are disconnected. Routing runs separately from the WebSocket reader so ping and pong frames remain responsive during forwarding. Servers send client WebSocket pings every `TCP_KEEP_ALIVE` seconds (default `30`; set it as a positive-seconds environment variable). A connection may override this with `tcp_keep_alive=SECONDS` on `/connect`; trusted server-token connections default to 3 seconds. The server retains packets sent toward each client socket for at least its keepalive interval and reroutes recent packets if that socket closes unexpectedly. A connection that does not answer a ping closes after a further ten seconds. With a longer ping interval, detection of a dropped connection can take the interval plus ten seconds. Each node has its own connection and receipt lock, so packet delivery to different nodes can run concurrently. One server-wide cleanup ticker scans only active replay histories and nodes with recent receipts; idle nodes have no receipt timer or cleanup work. Replay attempts are capped at three per packet to avoid loops. Delivery and replay are best effort and may produce duplicates with the same `_id`; callers needing exactly-once handling should deduplicate. A server process crash loses its in-memory queues, so it cannot replay packets or emit later `failed` notices for them. Membership changes can briefly interrupt delivery. Keys generated before a server restart are lost, so tokens issued by that server can stop verifying after its old membership entry is replaced. If node identity must survive an issuer restart, the tokens must first be renewed under a different current ring owner; contacting another server alone proxies renewal back to the owner.
 
 The first server and full membership snapshots are practical limits on cluster size. This design scales across servers but is neither literally infinite nor coordinator fault tolerant.
+
+HTTP handlers share one error response path. Validation and authentication failures keep their HTTP status codes, such as `400` and `401`. Unexpected operational failures return `502 Bad Gateway` with a short standard response. WebSocket errors close the socket and use the existing replay and feedback behavior.
 
 ## Tests
 

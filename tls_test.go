@@ -184,7 +184,7 @@ func TestHTTPSWSSAndCertificateReload(t *testing.T) {
 	if err := os.WriteFile(certPath, []byte("invalid"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if got := reload(signature); got != http.StatusInternalServerError {
+	if got := reload(signature); got != http.StatusBadGateway {
 		t.Fatalf("invalid certificate reload returned %d", got)
 	}
 	if got := getSerial(); got != 1 {

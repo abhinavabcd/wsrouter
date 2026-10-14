@@ -133,7 +133,7 @@ func TestExternalAuthorizationAndExpiredRenewal(t *testing.T) {
 			assertAction("renew")
 			approved.Store(true)
 			c.Expires = time.Now().Add(-time.Hour).Unix()
-			expired, _ := servers[0].signToken(c)
+			expired := servers[0].signToken(c)
 			before := calls.Load()
 			dial(expired, http.StatusUnauthorized)
 			if calls.Load() != before {
@@ -163,7 +163,7 @@ func TestExternalAuthorizationAndExpiredRenewal(t *testing.T) {
 	plain := createNode(t, urls[0].URL, "no-verifier")
 	c, _ := servers[0].verifyToken(plain.token)
 	c.Expires = time.Now().Add(-time.Hour).Unix()
-	expired, _ := servers[0].signToken(c)
+	expired := servers[0].signToken(c)
 	req, _ := http.NewRequest(http.MethodPost, urls[1].URL+"/renew", nil)
 	req.Header.Set("Authorization", "Bearer "+expired)
 	resp, err := http.DefaultClient.Do(req)

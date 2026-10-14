@@ -143,17 +143,14 @@ func TestJSONAndToken(t *testing.T) {
 		t.Fatalf("wrong multi-destination field: %s, %v", batch, err)
 	}
 	s, _ := startCluster(t, 1)
-	token, err := s[0].signToken(claims{Issuer: s[0].id, NodeID: strings.Repeat("a", 32), XSrcID: "account", Expires: time.Now().Add(time.Hour).Unix()})
-	if err != nil {
-		t.Fatal(err)
-	}
+	token := s[0].signToken(claims{Issuer: s[0].id, NodeID: strings.Repeat("a", 32), XSrcID: "account", Expires: time.Now().Add(time.Hour).Unix()})
 	if _, err := s[0].verifyToken(token); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s[0].verifyToken(token + "x"); err == nil {
 		t.Fatal("tampered token accepted")
 	}
-	expired, _ := s[0].signToken(claims{Issuer: s[0].id, NodeID: strings.Repeat("a", 32), XSrcID: "account", Expires: time.Now().Add(-time.Hour).Unix()})
+	expired := s[0].signToken(claims{Issuer: s[0].id, NodeID: strings.Repeat("a", 32), XSrcID: "account", Expires: time.Now().Add(-time.Hour).Unix()})
 	if _, err := s[0].verifyToken(expired); err == nil {
 		t.Fatal("expired token accepted")
 	}
@@ -180,10 +177,7 @@ func TestMessageTimestampAcrossServers(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.NodeType = "server"
-	serverToken, err := servers[0].signToken(c)
-	if err != nil {
-		t.Fatal(err)
-	}
+	serverToken := servers[0].signToken(c)
 	nodeConn := connectNode(t, sourceOwner.Addr, source.token, "")
 	serverConn := connectNode(t, sourceOwner.Addr, serverToken, "")
 	destConn := connectNode(t, destOwner.Addr, dest.token, "")

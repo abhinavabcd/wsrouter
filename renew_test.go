@@ -20,7 +20,7 @@ func TestRenewAtOwnerClosesOnlyRenewedNode(t *testing.T) {
 	other := createNode(t, urls[0].URL, "unrelated")
 	c, _ := servers[0].verifyToken(node.token)
 	c.NodeType = "server"
-	serverToken, _ := servers[0].signToken(c)
+	serverToken := servers[0].signToken(c)
 	first := connectNode(t, urls[0].URL, node.token, "")
 	second := connectNode(t, urls[0].URL, serverToken, "")
 	otherConn := connectNode(t, urls[0].URL, other.token, "")
@@ -88,7 +88,7 @@ func TestRenewProxyReturnsOwnerDenialWithoutDisconnect(t *testing.T) {
 	waitConnections(t, servers[ownerIndex], node.id, 1)
 	c, _ := servers[0].verifyToken(node.token)
 	c.AuthVerifyURL = verifier.URL
-	token, _ := servers[0].signToken(c)
+	token := servers[0].signToken(c)
 	req, _ := http.NewRequest(http.MethodPost, urls[1-ownerIndex].URL+"/renew", strings.NewReader(`{"valid_for":60}`))
 	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := http.DefaultClient.Do(req)
@@ -97,7 +97,7 @@ func TestRenewProxyReturnsOwnerDenialWithoutDisconnect(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized || string(body) != "authorization denied\n" || resp.Header.Get("Content-Type") != "text/plain; charset=utf-8" || calls.Load() != 1 {
+	if resp.StatusCode != http.StatusUnauthorized || string(body) != "Unauthorized\n" || resp.Header.Get("Content-Type") != "text/plain; charset=utf-8" || calls.Load() != 1 {
 		t.Fatalf("owner denial not proxied: %s %s, calls=%d", resp.Status, body, calls.Load())
 	}
 	waitConnections(t, servers[ownerIndex], node.id, 1)

@@ -164,6 +164,26 @@ type server struct {
 	nodeCount     atomic.Int64
 }
 
+type peerFrame struct {
+	Packet  packet `json:"packet"`
+	Hops    uint8  `json:"hops,omitempty"`
+	Replays uint8  `json:"replays,omitempty"`
+}
+
+type peerLink struct {
+	server   *server
+	peerID   uint64
+	conn     *websocket.Conn
+	send     chan []byte
+	feedback chan []byte
+	incoming chan packet
+	done     chan struct{}
+	once     sync.Once
+	mu       sync.Mutex
+	history  []replayRecord
+	head     int
+}
+
 func main() {
 	listen := flag.String("listen", ":8080", "HTTP or HTTPS listen address")
 	sslCerts := flag.String("ssl_certs", "", "directory containing a TLS certificate and private key")
@@ -248,61 +268,50 @@ func (s *server) reloadCertificate() error {
 	if err != nil {
 		return err
 	}
+	files := make(map[string]bool, len(entries))
 	var pemFiles, keyFiles []string
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
-		switch {
-		case strings.HasSuffix(entry.Name(), ".key"):
-			keyFiles = append(keyFiles, entry.Name())
-		case strings.HasSuffix(entry.Name(), ".pem"):
-			pemFiles = append(pemFiles, entry.Name())
+		name := entry.Name()
+		files[name] = true
+		switch filepath.Ext(name) {
+		case ".pem":
+			pemFiles = append(pemFiles, name)
+		case ".key":
+			keyFiles = append(keyFiles, name)
 		}
 	}
 	var certFile, keyFile string
-	if len(keyFiles) == 1 {
+	switch len(keyFiles) {
+	case 1:
 		keyFile = keyFiles[0]
 		matching := strings.TrimSuffix(keyFile, ".key") + ".pem"
-		for _, name := range pemFiles {
-			if name == matching {
-				certFile = name
-				break
-			}
-		}
-		if certFile == "" && len(pemFiles) == 1 {
+		switch {
+		case files[matching]:
+			certFile = matching
+		case len(pemFiles) == 1:
 			certFile = pemFiles[0]
+		case files["fullchain.pem"]:
+			certFile = "fullchain.pem"
 		}
-		if certFile == "" {
-			for _, name := range pemFiles {
-				if name == "fullchain.pem" {
-					certFile = name
-					break
-				}
-			}
-		}
-	} else if len(keyFiles) == 0 {
+	case 0:
 		for _, pair := range [][2]string{{"fullchain.pem", "privkey.pem"}, {"public.pem", "private.pem"}, {"cert.pem", "key.pem"}} {
-			certExists, keyExists := false, false
-			for _, name := range pemFiles {
-				certExists = certExists || name == pair[0]
-				keyExists = keyExists || name == pair[1]
-			}
-			if certExists && keyExists {
+			if files[pair[0]] && files[pair[1]] {
 				certFile, keyFile = pair[0], pair[1]
 				break
 			}
 		}
 	}
 	if certFile == "" || keyFile == "" {
-		return fmt.Errorf("expected one certificate and private key pair in %s", s.sslCerts)
+		return errors.New("certificate pair not found")
 	}
 	cert, err := tls.LoadX509KeyPair(filepath.Join(s.sslCerts, certFile), filepath.Join(s.sslCerts, keyFile))
-	if err != nil {
-		return err
+	if err == nil {
+		s.certificate.Store(&cert)
 	}
-	s.certificate.Store(&cert)
-	return nil
+	return err
 }
 
 func (s *server) tlsConfig() *tls.Config {
@@ -318,38 +327,38 @@ func (s *server) tlsConfig() *tls.Config {
 	}
 }
 
-func (s *server) reload(w http.ResponseWriter, r *http.Request) {
+func (s *server) reload(w http.ResponseWriter, r *http.Request) error {
 	if s.sslCerts == "" {
-		http.NotFound(w, r)
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "POST required", http.StatusMethodNotAllowed)
-		return
+		return httpStatus(http.StatusNotFound)
 	}
 	if !verifyBody([]byte("POST /reload"), r.Header.Get("X-Cluster-Signature"), s.serverSecret) {
-		http.Error(w, "invalid cluster signature", http.StatusUnauthorized)
-		return
+		return httpStatus(http.StatusUnauthorized)
 	}
 	if err := s.reloadCertificate(); err != nil {
-		log.Printf("TLS certificate reload failed: %v", err)
-		http.Error(w, "TLS certificate reload failed", http.StatusInternalServerError)
-		return
+		return err
 	}
 	w.WriteHeader(http.StatusNoContent)
+	return nil
 }
 
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/create", s.create)
-	mux.HandleFunc("/renew", s.renew)
-	mux.HandleFunc("/connect", s.connect)
-	mux.HandleFunc("/locate", s.locate)
-	mux.HandleFunc("/peer", s.peer)
-	mux.HandleFunc("/refresh", s.refresh)
-	mux.HandleFunc("/snapshot", s.receiveSnapshot)
-	mux.HandleFunc("/health", s.health)
-	mux.HandleFunc("/reload", s.reload)
+	handle := func(pattern string, handler func(http.ResponseWriter, *http.Request) error) {
+		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+			if err := handler(w, r); err != nil {
+				writeHTTPError(w, err)
+			}
+		})
+	}
+	handle("POST /create", s.create)
+	handle("POST /renew", s.renew)
+	handle("GET /connect", s.connect)
+	handle("GET /locate", s.locate)
+	handle("GET /peer", s.peer)
+	handle("POST /refresh", s.refresh)
+	handle("POST /snapshot", s.receiveSnapshot)
+	handle("POST /reload", s.reload)
+	mux.HandleFunc("GET /health", s.health)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
@@ -360,6 +369,18 @@ func (s *server) routes() http.Handler {
 		}
 		mux.ServeHTTP(w, r)
 	})
+}
+
+type httpStatus int
+
+func (status httpStatus) Error() string { return http.StatusText(int(status)) }
+
+func writeHTTPError(w http.ResponseWriter, err error) {
+	code := http.StatusBadGateway
+	if status, ok := err.(httpStatus); ok {
+		code = int(status)
+	}
+	http.Error(w, http.StatusText(code), code)
 }
 
 func tokenExpiry(validFor *int64) (int64, error) {
@@ -374,11 +395,7 @@ func tokenExpiry(validFor *int64) (int64, error) {
 	return now + seconds, nil
 }
 
-func (s *server) create(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "POST required", http.StatusMethodNotAllowed)
-		return
-	}
+func (s *server) create(w http.ResponseWriter, r *http.Request) error {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4096))
 	var req struct {
 		XSrcID        string `json:"x_src_id"`
@@ -387,65 +404,50 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) {
 		AuthVerifyURL string `json:"auth_verify_url"`
 	}
 	if err != nil || json.Unmarshal(body, &req) != nil || len(req.XSrcID) == 0 || len(req.XSrcID) > 256 || (req.NodeType != "" && req.NodeType != "node" && req.NodeType != "server") {
-		http.Error(w, "invalid x_src_id or node_type", http.StatusBadRequest)
-		return
+		return httpStatus(http.StatusBadRequest)
 	}
 	if req.NodeType == "server" && !verifyBody(body, r.Header.Get("X-Cluster-Signature"), s.serverSecret) {
-		http.Error(w, "server node requires a cluster signature", http.StatusUnauthorized)
-		return
+		return httpStatus(http.StatusUnauthorized)
 	}
 	if req.AuthVerifyURL != "" {
 		if _, err := parseVerifyURL(req.AuthVerifyURL); err != nil {
-			http.Error(w, "invalid auth_verify_url", http.StatusBadRequest)
-			return
+			return httpStatus(http.StatusBadRequest)
 		}
 	}
 	expires, err := tokenExpiry(req.ValidFor)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return httpStatus(http.StatusBadRequest)
 	}
 	id := make([]byte, 16)
 	if _, err := rand.Read(id); err != nil {
-		http.Error(w, "random source failed", http.StatusInternalServerError)
-		return
+		return err
 	}
 	if req.NodeType == "" {
 		req.NodeType = "node"
 	}
 	c := claims{Issuer: s.id, NodeID: hex.EncodeToString(id), XSrcID: req.XSrcID, NodeType: req.NodeType, Expires: expires, AuthVerifyURL: req.AuthVerifyURL}
-	token, err := s.signToken(c)
-	if err != nil {
-		http.Error(w, "token creation failed", http.StatusInternalServerError)
-		return
-	}
+	token := s.signToken(c)
 	w.Header().Set("Content-Type", "application/json")
 	result := map[string]any{"node_id": c.NodeID, "node_type": c.NodeType, "token": token, "expires": c.Expires}
 	if owner, ok := s.owner(c.NodeID); ok {
 		result["address"] = owner.Addr
 	}
 	json.NewEncoder(w).Encode(result)
+	return nil
 }
 
-func (s *server) renew(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "POST required", http.StatusMethodNotAllowed)
-		return
-	}
+func (s *server) renew(w http.ResponseWriter, r *http.Request) error {
 	authorization := r.Header.Get("Authorization")
 	if !strings.HasPrefix(authorization, "Bearer ") {
-		http.Error(w, "bearer token required", http.StatusUnauthorized)
-		return
+		return httpStatus(http.StatusUnauthorized)
 	}
 	c, err := s.verifyTokenSignature(strings.TrimPrefix(authorization, "Bearer "))
 	if err != nil || (c.Expires <= time.Now().Unix() && c.AuthVerifyURL == "") {
-		http.Error(w, "invalid token", http.StatusUnauthorized)
-		return
+		return httpStatus(http.StatusUnauthorized)
 	}
 	owner, ok := s.owner(c.NodeID)
 	if !ok {
-		http.Error(w, "ring unavailable", http.StatusServiceUnavailable)
-		return
+		return httpStatus(http.StatusBadGateway)
 	}
 	if owner.Addr != s.addr {
 		hops := 0
@@ -453,57 +455,48 @@ func (s *server) renew(w http.ResponseWriter, r *http.Request) {
 			hops, err = strconv.Atoi(raw)
 		}
 		if err != nil || hops < 0 || hops >= 4 {
-			http.Error(w, "renewal forwarding exceeded four hops", http.StatusLoopDetected)
-			return
+			return httpStatus(http.StatusLoopDetected)
 		}
 		target, err := url.Parse(owner.Addr)
 		if err != nil {
-			http.Error(w, "invalid owner address", http.StatusBadGateway)
-			return
+			return httpStatus(http.StatusBadGateway)
 		}
 		proxy := httputil.NewSingleHostReverseProxy(target)
 		proxy.Transport = s.httpClient.Transport
 		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-			http.Error(w, "node owner unavailable", http.StatusBadGateway)
+			writeHTTPError(w, err)
 		}
 		r.Header.Set("X-Renew-Hops", strconv.Itoa(hops+1))
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
 		proxy.ServeHTTP(w, r.WithContext(ctx))
-		return
+		return nil
 	}
 	var req struct {
 		ValidFor *int64 `json:"valid_for"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&req); err != nil && err != io.EOF {
-		http.Error(w, "invalid valid_for", http.StatusBadRequest)
-		return
+		return httpStatus(http.StatusBadRequest)
 	}
 	expires, err := tokenExpiry(req.ValidFor)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return httpStatus(http.StatusBadRequest)
 	}
 	if err := s.verifyAuthorization(r.Context(), c.AuthVerifyURL, "renew"); err != nil {
-		http.Error(w, "authorization denied", http.StatusUnauthorized)
-		return
+		return httpStatus(http.StatusUnauthorized)
 	}
 	nonce := make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {
-		http.Error(w, "random source failed", http.StatusInternalServerError)
-		return
+		return err
 	}
 	c.Nonce = hex.EncodeToString(nonce)
 	c.Issuer = s.id
 	c.Expires = expires
-	token, err := s.signToken(c)
-	if err != nil {
-		http.Error(w, "token creation failed", http.StatusInternalServerError)
-		return
-	}
+	token := s.signToken(c)
 	s.disconnectNode(c.NodeID)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"node_id": c.NodeID, "node_type": c.NodeType, "token": token, "expires": c.Expires})
+	return nil
 }
 
 func (s *server) disconnectNode(nodeID string) {
@@ -530,61 +523,48 @@ func (s *server) disconnectNode(nodeID string) {
 	}
 }
 
-func (s *server) locate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "GET required", http.StatusMethodNotAllowed)
-		return
-	}
+func (s *server) locate(w http.ResponseWriter, r *http.Request) error {
 	token := r.URL.Query().Get("token")
 	if token == "" && strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
 		token = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	}
 	c, err := s.verifyToken(token)
 	if err != nil {
-		http.Error(w, "invalid token", http.StatusUnauthorized)
-		return
+		return httpStatus(http.StatusUnauthorized)
 	}
 	if err := s.verifyAuthorization(r.Context(), c.AuthVerifyURL, ""); err != nil {
-		http.Error(w, "authorization denied", http.StatusUnauthorized)
-		return
+		return httpStatus(http.StatusUnauthorized)
 	}
 	owner, ok := s.owner(c.NodeID)
 	if !ok {
-		http.Error(w, "ring unavailable", http.StatusServiceUnavailable)
-		return
+		return httpStatus(http.StatusBadGateway)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"address": owner.Addr})
+	return nil
 }
 
-func (s *server) connect(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "GET required", http.StatusMethodNotAllowed)
-		return
-	}
+func (s *server) connect(w http.ResponseWriter, r *http.Request) error {
 	token := r.URL.Query().Get("token")
 	if token == "" && strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
 		token = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	}
 	c, err := s.verifyToken(token)
 	if err != nil {
-		http.Error(w, "invalid token", http.StatusUnauthorized)
-		return
+		return httpStatus(http.StatusUnauthorized)
 	}
 	owner, ok := s.owner(c.NodeID)
 	if !ok {
-		http.Error(w, "ring unavailable", http.StatusServiceUnavailable)
-		return
+		return httpStatus(http.StatusBadGateway)
 	}
 	if owner.Addr != s.addr {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusMisdirectedRequest)
 		json.NewEncoder(w).Encode(map[string]string{"address": owner.Addr})
-		return
+		return nil
 	}
 	if err := s.verifyAuthorization(r.Context(), c.AuthVerifyURL, ""); err != nil {
-		http.Error(w, "authorization denied", http.StatusUnauthorized)
-		return
+		return httpStatus(http.StatusUnauthorized)
 	}
 	keepAlive := s.keepAlive
 	if c.NodeType == "server" {
@@ -593,14 +573,13 @@ func (s *server) connect(w http.ResponseWriter, r *http.Request) {
 	if raw := r.URL.Query().Get("tcp_keep_alive"); raw != "" {
 		interval, err := time.ParseDuration(raw + "s")
 		if err != nil || interval <= 0 || interval > time.Duration(math.MaxInt64)-10*time.Second {
-			http.Error(w, "tcp_keep_alive must be a positive number of seconds", http.StatusBadRequest)
-			return
+			return httpStatus(http.StatusBadRequest)
 		}
 		keepAlive = interval
 	}
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		return
+		return nil
 	}
 	cl := &client{conn: conn, nodeID: c.NodeID, xSrcID: c.XSrcID, nodeType: c.NodeType, keepAlive: keepAlive, send: make(chan outbound, 4096), done: make(chan struct{}), server: s}
 	s.mu.Lock()
@@ -620,39 +599,31 @@ func (s *server) connect(w http.ResponseWriter, r *http.Request) {
 		cl.reconnect(now.Addr)
 	}
 	cl.readLoop()
+	return nil
 }
 
-func (s *server) refresh(w http.ResponseWriter, r *http.Request) {
+func (s *server) refresh(w http.ResponseWriter, r *http.Request) error {
 	if !s.leader {
-		http.Error(w, "not cluster leader", http.StatusNotFound)
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "POST required", http.StatusMethodNotAllowed)
-		return
+		return httpStatus(http.StatusNotFound)
 	}
 	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1024))
 	if err != nil || !verifyBody(data, r.Header.Get("X-Cluster-Signature"), s.serverSecret) {
-		http.Error(w, "invalid cluster signature", http.StatusUnauthorized)
-		return
+		return httpStatus(http.StatusUnauthorized)
 	}
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
 	var p peer
 	if json.Unmarshal(data, &p) != nil || p.ID > math.MaxInt64 || p.Addr == "" || p.Nodes < 0 || len(p.AuthKey) != 32 {
-		http.Error(w, "invalid member", http.StatusBadRequest)
-		return
+		return httpStatus(http.StatusBadRequest)
 	}
 	u, err := url.Parse(p.Addr)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Path != "" || u.RawQuery != "" {
-		http.Error(w, "invalid member address", http.StatusBadRequest)
-		return
+		return httpStatus(http.StatusBadRequest)
 	}
 	s.mu.Lock()
 	if existing, ok := s.members[p.ID]; ok && existing.Addr != p.Addr {
 		s.mu.Unlock()
-		http.Error(w, "ring id already in use", http.StatusConflict)
-		return
+		return httpStatus(http.StatusConflict)
 	}
 	s.members[p.ID] = member{peer: p, Seen: time.Now()}
 	snapshot := s.snapshotLocked()
@@ -663,37 +634,32 @@ func (s *server) refresh(w http.ResponseWriter, r *http.Request) {
 	if s.applySnapshot(snapshot, s.epoch, version) {
 		s.broadcastSnapshot(r.Context(), state)
 	}
-	s.writeSignedJSON(w, state)
+	data, _ = json.Marshal(state)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Cluster-Signature", signBody(data, s.serverSecret))
+	w.Write(data)
+	return nil
 }
 
-func (s *server) receiveSnapshot(w http.ResponseWriter, r *http.Request) {
+func (s *server) receiveSnapshot(w http.ResponseWriter, r *http.Request) error {
 	if s.leader {
-		http.Error(w, "not a cluster follower", http.StatusNotFound)
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "POST required", http.StatusMethodNotAllowed)
-		return
+		return httpStatus(http.StatusNotFound)
 	}
 	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
 	if err != nil || !verifyBody(data, r.Header.Get("X-Cluster-Signature"), s.serverSecret) {
-		http.Error(w, "invalid cluster signature", http.StatusUnauthorized)
-		return
+		return httpStatus(http.StatusUnauthorized)
 	}
 	var state ringSnapshot
 	if json.Unmarshal(data, &state) != nil || state.Epoch <= 0 || state.Version == 0 || len(state.Peers) == 0 {
-		http.Error(w, "invalid snapshot", http.StatusBadRequest)
-		return
+		return httpStatus(http.StatusBadRequest)
 	}
 	s.applySnapshot(state.Peers, state.Epoch, state.Version)
 	w.WriteHeader(http.StatusNoContent)
+	return nil
 }
 
 func (s *server) broadcastSnapshot(ctx context.Context, state ringSnapshot) {
-	data, err := json.Marshal(state)
-	if err != nil {
-		return
-	}
+	data, _ := json.Marshal(state)
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	signature := signBody(data, s.serverSecret)
@@ -893,9 +859,11 @@ func (s *server) routePacket(ctx context.Context, p packet) error {
 		if p.hops >= 4 {
 			return errors.New("peer routing exceeded four hops")
 		}
-		if err := s.forwardOverPeer(ctx, owner, p); err == nil {
-			return nil
-		} else if attempt == 1 {
+		link, err := s.getPeerLink(owner)
+		if err == nil {
+			err = link.enqueue(ctx, p)
+		}
+		if err == nil || attempt == 1 {
 			return err
 		}
 		if err := s.refreshOnce(ctx); err != nil {
@@ -903,6 +871,15 @@ func (s *server) routePacket(ctx context.Context, p packet) error {
 		}
 	}
 	return errors.New("ring changed during forwarding")
+}
+
+func (s *server) route(p packet) {
+	if err := s.routePacket(context.Background(), p); err != nil {
+		s.routeErrors.Add(1)
+		if p.Type != "status" {
+			s.sendStatus(p, false)
+		}
+	}
 }
 
 func (s *server) deliver(p packet, data []byte) bool {
@@ -925,7 +902,7 @@ func (s *server) deliver(p packet, data []byte) bool {
 		case cl.send <- outbound{data: data}:
 			delivered = true
 			if p.replays < 3 {
-				cl.pruneSentLocked(time.Now())
+				cl.sent, cl.sentHead = pruneHistory(cl.sent, cl.sentHead, time.Now().Add(-cl.keepAlive))
 				if len(cl.sent) == 0 {
 					s.recentClients.Store(cl, struct{}{})
 				}
@@ -984,7 +961,7 @@ func (s *server) cleanupReceipts(now time.Time) {
 	s.recentClients.Range(func(key, value any) bool {
 		cl := key.(*client)
 		cl.state.mu.Lock()
-		cl.pruneSentLocked(now)
+		cl.sent, cl.sentHead = pruneHistory(cl.sent, cl.sentHead, now.Add(-cl.keepAlive))
 		if len(cl.sent) == 0 {
 			s.recentClients.CompareAndDelete(cl, value)
 		}
@@ -1089,12 +1066,7 @@ func (cl *client) routeLoop(jobs <-chan routedPacket) {
 			p := job.packet
 			p.Dest = dest
 			p.Dests = nil
-			if err := cl.server.routePacket(context.Background(), p); err != nil {
-				cl.server.routeErrors.Add(1)
-				if p.Type != "status" {
-					cl.server.sendStatus(p, false)
-				}
-			}
+			cl.server.route(p)
 		}
 	}
 }
@@ -1150,7 +1122,7 @@ func (cl *client) close() {
 		state := cl.state
 		state.mu.Lock()
 		delete(state.connections, cl)
-		cl.pruneSentLocked(time.Now())
+		cl.sent, cl.sentHead = pruneHistory(cl.sent, cl.sentHead, time.Now().Add(-cl.keepAlive))
 		if !cl.normalClose.Load() {
 			replay = append(replay, cl.sent[cl.sentHead:]...)
 		}
@@ -1179,12 +1151,7 @@ func (cl *client) close() {
 				retried[[2]string{p.sourceNodeID(), p.PacketID}] = struct{}{}
 			}
 			p.replays++
-			if err := s.routePacket(context.Background(), p); err != nil {
-				s.routeErrors.Add(1)
-				if p.Type != "status" {
-					s.sendStatus(p, false)
-				}
-			}
+			s.route(p)
 		}
 		if len(recent) == 0 {
 			return
@@ -1221,10 +1188,7 @@ func (cl *client) close() {
 }
 
 func encodePacket(p packet) ([]byte, error) {
-	data, err := json.Marshal(p)
-	if err != nil {
-		return nil, err
-	}
+	data, _ := json.Marshal(p)
 	if len(data) > 1<<20 {
 		return nil, errors.New("packet too large")
 	}
@@ -1250,15 +1214,12 @@ func (s *server) peerKey(id uint64) ([]byte, bool) {
 	return s.ring[i].AuthKey, true
 }
 
-func (s *server) signToken(c claims) (string, error) {
-	data, err := json.Marshal(c)
-	if err != nil {
-		return "", err
-	}
+func (s *server) signToken(c claims) string {
+	data, _ := json.Marshal(c)
 	payload := base64.RawURLEncoding.EncodeToString(data)
 	mac := hmac.New(sha256.New, s.authKey)
 	mac.Write([]byte(payload))
-	return payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
+	return payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
 func (s *server) verifyToken(token string) (claims, error) {
@@ -1273,11 +1234,11 @@ func (s *server) verifyToken(token string) (claims, error) {
 }
 
 func (s *server) verifyTokenSignature(token string) (claims, error) {
-	parts := strings.Split(token, ".")
-	if len(parts) != 2 || len(token) > 8192 {
+	payload, signature, ok := strings.Cut(token, ".")
+	if !ok || len(token) > 8192 {
 		return claims{}, errors.New("invalid token")
 	}
-	data, err := base64.RawURLEncoding.DecodeString(parts[0])
+	data, err := base64.RawURLEncoding.DecodeString(payload)
 	if err != nil {
 		return claims{}, err
 	}
@@ -1292,12 +1253,12 @@ func (s *server) verifyTokenSignature(token string) (claims, error) {
 	if !ok {
 		return claims{}, errors.New("unknown token issuer")
 	}
-	got, err := base64.RawURLEncoding.DecodeString(parts[1])
+	got, err := base64.RawURLEncoding.DecodeString(signature)
 	if err != nil {
 		return claims{}, err
 	}
 	mac := hmac.New(sha256.New, key)
-	mac.Write([]byte(parts[0]))
+	mac.Write([]byte(payload))
 	if !hmac.Equal(got, mac.Sum(nil)) {
 		return claims{}, errors.New("invalid signature")
 	}
@@ -1320,13 +1281,279 @@ func verifyBody(data []byte, signature string, key []byte) bool {
 	return hmac.Equal(got, mac.Sum(nil))
 }
 
-func (s *server) writeSignedJSON(w http.ResponseWriter, value any) {
-	data, err := json.Marshal(value)
+func parseVerifyURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil || len(raw) > 2048 || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || u.Fragment != "" {
+		return nil, errors.New("invalid auth_verify_url")
+	}
+	return u, nil
+}
+
+// verifyAuthorization never sends the node's bearer token to the verifier.
+func (s *server) verifyAuthorization(ctx context.Context, rawURL, action string) error {
+	if rawURL == "" {
+		return nil
+	}
+	u, err := parseVerifyURL(rawURL)
 	if err != nil {
-		http.Error(w, "snapshot error", http.StatusInternalServerError)
+		return err
+	}
+	if action != "" {
+		query := u.Query()
+		query.Set("action", action)
+		u.RawQuery = query.Encode()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return err
+	}
+	client := *s.httpClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 17))
+	if err != nil || resp.StatusCode != http.StatusOK || len(body) > 16 || !strings.EqualFold(strings.TrimSpace(string(body)), "ok") {
+		return errors.New("authorization denied")
+	}
+	return nil
+}
+
+func (s *server) peer(w http.ResponseWriter, r *http.Request) error {
+	id, err := strconv.ParseUint(r.Header.Get("X-Server-ID"), 10, 64)
+	key, known := s.peerKey(id)
+	if err != nil || !known || id == s.id || !verifyBody([]byte("GET /peer"), r.Header.Get("X-Server-Signature"), key) {
+		return httpStatus(http.StatusUnauthorized)
+	}
+	conn, err := s.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return nil
+	}
+	s.addPeerLink(id, conn)
+	return nil
+}
+
+func (s *server) getPeerLink(owner peer) (*peerLink, error) {
+	s.peerDialMu.Lock()
+	defer s.peerDialMu.Unlock()
+	s.peerMu.Lock()
+	if link := s.peerLinks[owner.ID]; link != nil {
+		select {
+		case <-link.done:
+		default:
+			s.peerMu.Unlock()
+			return link, nil
+		}
+	}
+	s.peerMu.Unlock()
+	address := "ws" + strings.TrimPrefix(owner.Addr, "http") + "/peer"
+	headers := http.Header{}
+	headers.Set("X-Server-ID", strconv.FormatUint(s.id, 10))
+	headers.Set("X-Server-Signature", signBody([]byte("GET /peer"), s.authKey))
+	conn, resp, err := (&websocket.Dialer{Proxy: http.ProxyFromEnvironment, HandshakeTimeout: 10 * time.Second}).Dial(address, headers)
+	if err != nil {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return nil, err
+	}
+	return s.addPeerLink(owner.ID, conn), nil
+}
+
+func (s *server) addPeerLink(peerID uint64, conn *websocket.Conn) *peerLink {
+	link := &peerLink{server: s, peerID: peerID, conn: conn, send: make(chan []byte, 4096), feedback: make(chan []byte, 4096), incoming: make(chan packet, 4096), done: make(chan struct{})}
+	s.peerMu.Lock()
+	old := s.peerLinks[link.peerID]
+	if old == nil {
+		s.peerLinks[link.peerID] = link
+	} else {
+		select {
+		case <-old.done:
+			s.peerLinks[link.peerID] = link
+		default:
+		}
+	}
+	s.allPeerLinks[link] = struct{}{}
+	s.peerMu.Unlock()
+	go link.writeLoop()
+	for range 16 {
+		go link.processLoop()
+	}
+	go link.readLoop()
+	return link
+}
+
+func (link *peerLink) enqueue(ctx context.Context, p packet) error {
+	frame := peerFrame{Packet: p, Hops: p.hops, Replays: p.replays}
+	data, _ := json.Marshal(frame)
+	if len(data) > 1<<20+4096 {
+		return errors.New("peer packet too large")
+	}
+	link.mu.Lock()
+	select {
+	case <-link.done:
+		link.mu.Unlock()
+		return errors.New("peer link closed")
+	default:
+	}
+	link.recordLocked(p, time.Now())
+	link.mu.Unlock()
+	queue := link.send
+	if p.Type == "status" {
+		queue = link.feedback
+	}
+	select {
+	case <-link.done:
+		return errors.New("peer link closed")
+	case <-ctx.Done():
+		return ctx.Err()
+	case queue <- data:
+		return nil
+	}
+}
+
+func (link *peerLink) readLoop() {
+	defer link.close()
+	defer close(link.incoming)
+	link.conn.SetReadLimit(1<<20 + 4096)
+	link.conn.SetReadDeadline(time.Now().Add(13 * time.Second))
+	link.conn.SetPongHandler(func(string) error { return link.conn.SetReadDeadline(time.Now().Add(13 * time.Second)) })
+	for {
+		kind, data, err := link.conn.ReadMessage()
+		if err != nil || kind != websocket.TextMessage {
+			return
+		}
+		var frame peerFrame
+		if json.Unmarshal(data, &frame) != nil || frame.Packet.Dest == "" || len(frame.Packet.Dests) != 0 || frame.Packet.sourceNodeID() == "" || frame.Packet.Type == "" || frame.Packet.Type == "reconnect" || frame.Hops >= 4 {
+			return
+		}
+		p := frame.Packet
+		if p.Timestamp == nil {
+			now := time.Now().UnixMilli()
+			p.Timestamp = &now
+		}
+		p.hops = frame.Hops + 1
+		p.replays = frame.Replays
+		link.mu.Lock()
+		link.recordLocked(p, time.Now())
+		link.mu.Unlock()
+		select {
+		case link.incoming <- p:
+		case <-link.done:
+			return
+		}
+	}
+}
+
+func (link *peerLink) processLoop() {
+	for p := range link.incoming {
+		link.server.route(p)
+	}
+}
+
+func (link *peerLink) writeLoop() {
+	defer link.close()
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	for {
+		kind := websocket.TextMessage
+		var data []byte
+		// Pings must stay responsive; feedback takes priority over new data.
+		select {
+		case <-link.done:
+			return
+		case <-ticker.C:
+			kind = websocket.PingMessage
+		default:
+			select {
+			case data = <-link.feedback:
+			default:
+				select {
+				case <-link.done:
+					return
+				case <-ticker.C:
+					kind = websocket.PingMessage
+				case data = <-link.feedback:
+				case data = <-link.send:
+				}
+			}
+		}
+		link.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if err := link.conn.WriteMessage(kind, data); err != nil {
+			return
+		}
+	}
+}
+
+func (link *peerLink) recordLocked(p packet, now time.Time) {
+	if p.replays >= 3 {
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Cluster-Signature", signBody(data, s.serverSecret))
-	w.Write(data)
+	link.history, link.head = pruneHistory(link.history, link.head, now.Add(-3*time.Second))
+	link.history = append(link.history, replayRecord{packet: p, sentAt: now})
+}
+
+func (link *peerLink) close() {
+	link.once.Do(func() {
+		close(link.done)
+		link.conn.Close()
+		s := link.server
+		s.peerMu.Lock()
+		delete(s.allPeerLinks, link)
+		if s.peerLinks[link.peerID] == link {
+			delete(s.peerLinks, link.peerID)
+			for other := range s.allPeerLinks {
+				if other.peerID == link.peerID {
+					s.peerLinks[link.peerID] = other
+					break
+				}
+			}
+		}
+		s.peerMu.Unlock()
+		link.mu.Lock()
+		link.history, link.head = pruneHistory(link.history, link.head, time.Now().Add(-3*time.Second))
+		replay := append([]replayRecord(nil), link.history[link.head:]...)
+		link.history, link.head = nil, 0
+		link.mu.Unlock()
+		if len(replay) != 0 {
+			go func() {
+				for _, item := range replay {
+					p := item.packet
+					p.replays++
+					s.route(p)
+				}
+			}()
+		}
+	})
+}
+
+func (s *server) cleanupPeerLinks(now time.Time) {
+	s.peerMu.Lock()
+	links := make([]*peerLink, 0, len(s.allPeerLinks))
+	for link := range s.allPeerLinks {
+		links = append(links, link)
+	}
+	s.peerMu.Unlock()
+	for _, link := range links {
+		link.mu.Lock()
+		link.history, link.head = pruneHistory(link.history, link.head, now.Add(-3*time.Second))
+		link.mu.Unlock()
+	}
+}
+
+func pruneHistory(history []replayRecord, head int, cutoff time.Time) ([]replayRecord, int) {
+	for head < len(history) && history[head].sentAt.Before(cutoff) {
+		head++
+	}
+	if head == len(history) {
+		return nil, 0
+	}
+	if head > 1024 && head*2 >= len(history) {
+		return append([]replayRecord(nil), history[head:]...), 0
+	}
+	return history, head
 }
