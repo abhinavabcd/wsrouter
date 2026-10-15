@@ -46,8 +46,8 @@ func startCluster(t *testing.T, count int) ([]*server, []*httptest.Server) {
 		if i == 0 {
 			servers[i].clusterAddr = httpServers[i].URL
 			servers[i].mu.Lock()
-			servers[i].members[id] = member{peer: peer{ID: id, Addr: httpServers[i].URL, AuthKey: servers[i].authKey}, Seen: time.Now()}
-			servers[i].ring = []peer{{ID: id, Addr: httpServers[i].URL, AuthKey: servers[i].authKey}}
+			servers[i].members[id] = member{peer: peer{ID: id, Addr: httpServers[i].URL, AuthToken: servers[i].serverToken}, Seen: time.Now()}
+			servers[i].ring = []peer{{ID: id, Addr: httpServers[i].URL, AuthToken: servers[i].serverToken}}
 			servers[i].mu.Unlock()
 		} else if err := servers[i].refreshOnce(context.Background()); err != nil {
 			t.Fatal(err)
@@ -267,8 +267,8 @@ func TestMessageTimestampAcrossServers(t *testing.T) {
 func TestTwoServerRoutingKeysAndCORS(t *testing.T) {
 	servers, httpServers := startCluster(t, 2)
 	leader, follower := servers[0], servers[1]
-	if bytes.Equal(leader.authKey, follower.authKey) {
-		t.Fatal("servers share an authentication key")
+	if !bytes.Equal(leader.serverSecret, follower.serverSecret) {
+		t.Fatal("servers must share the configured signing secret")
 	}
 	leaderURL, followerURL := httpServers[0].URL, httpServers[1].URL
 	source := createNode(t, followerURL, "source-account")
@@ -285,8 +285,8 @@ func TestTwoServerRoutingKeysAndCORS(t *testing.T) {
 	if _, err := follower.verifyToken(dest.token); err != nil {
 		t.Fatalf("follower rejected leader-issued token: %v", err)
 	}
-	if len(leader.ring[1].AuthKey) != 32 || len(follower.ring[0].AuthKey) != 32 {
-		t.Fatal("server keys not broadcast")
+	if leader.ring[1].AuthToken != follower.serverToken || follower.ring[0].AuthToken != leader.serverToken {
+		t.Fatal("server tokens not broadcast")
 	}
 	locateReq, _ := http.NewRequest(http.MethodGet, leaderURL+"/locate", nil)
 	locateReq.Header.Set("Origin", "https://other.example")
@@ -658,7 +658,9 @@ func TestStressFiveServers(t *testing.T) {
 				s.peerMu.Lock()
 				for link := range s.allPeerLinks {
 					queuedData += len(link.send)
-					queuedFeedback += len(link.feedback)
+					link.mu.Lock()
+					queuedFeedback += len(link.feedback) - link.feedbackHead
+					link.mu.Unlock()
 					queuedIncoming += len(link.incoming)
 				}
 				s.peerMu.Unlock()
@@ -671,7 +673,7 @@ func TestStressFiveServers(t *testing.T) {
 	}
 }
 
-func TestJoinBroadcastsKeyBeforeForwarding(t *testing.T) {
+func TestJoinBroadcastsTokenBeforeForwarding(t *testing.T) {
 	servers, urls := startCluster(t, 2)
 	leader, existing := servers[0], servers[1]
 	joining := newServer(2*uint64(math.MaxInt64/3), "http://placeholder", urls[0].URL, leader.serverSecret)
@@ -681,9 +683,9 @@ func TestJoinBroadcastsKeyBeforeForwarding(t *testing.T) {
 	if err := joining.refreshOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	key, ok := existing.peerKey(joining.id)
-	if !ok || !bytes.Equal(key, joining.authKey) {
-		t.Fatal("existing server did not receive joining server key")
+	token, ok := existing.peerToken(joining.id)
+	if !ok || token != joining.serverToken {
+		t.Fatal("existing server did not receive joining server token")
 	}
 	source := createNode(t, ts.URL, "new-account")
 	for owner, _ := joining.owner(source.id); owner.Addr != ts.URL; owner, _ = joining.owner(source.id) {
@@ -830,7 +832,7 @@ func TestDisconnectReroutesToNewOwnerBeforeFeedback(t *testing.T) {
 		}
 	}
 	// Change ownership without initiating a reconnect, to exercise abrupt close.
-	newRing := []peer{{ID: servers[1].id, Addr: urls[1].URL, AuthKey: servers[1].authKey}}
+	newRing := []peer{{ID: servers[1].id, Addr: urls[1].URL, AuthToken: servers[1].serverToken}}
 	servers[1].mu.Lock()
 	servers[1].ring = newRing
 	servers[1].mu.Unlock()

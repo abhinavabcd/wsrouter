@@ -253,7 +253,7 @@ func TestRateClaimCreationAndRenewal(t *testing.T) {
 	}
 	legacy, _ := json.Marshal(map[string]any{"issuer": servers[0].id, "node_id": strings.Repeat("a", 32), "x_src_id": "legacy", "expires": time.Now().Add(time.Hour).Unix()})
 	payload := base64.RawURLEncoding.EncodeToString(legacy)
-	mac, _ := hex.DecodeString(signBody([]byte(payload), servers[0].authKey))
+	mac, _ := hex.DecodeString(signBody([]byte(payload), servers[0].serverSecret))
 	c, err := servers[0].verifyToken(payload + "." + base64.RawURLEncoding.EncodeToString(mac))
 	if err != nil || c.RP5 != 10 {
 		t.Fatalf("legacy token did not get the default allowance: %+v, %v", c, err)

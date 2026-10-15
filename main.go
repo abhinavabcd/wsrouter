@@ -33,10 +33,10 @@ import (
 )
 
 type peer struct {
-	ID      uint64 `json:"id"`
-	Addr    string `json:"addr"`
-	Nodes   int64  `json:"nodes"`
-	AuthKey []byte `json:"auth_key"`
+	ID        uint64 `json:"id"`
+	Addr      string `json:"addr"`
+	Nodes     int64  `json:"nodes"`
+	AuthToken string `json:"auth_token"`
 }
 
 type ringSnapshot struct {
@@ -134,17 +134,18 @@ type client struct {
 }
 
 type server struct {
-	id           uint64
-	addr         string
-	clusterAddr  string
-	serverSecret []byte
-	authKey      []byte
-	leader       bool
-	httpClient   *http.Client
-	upgrader     websocket.Upgrader
-	sslCerts     string
-	keepAlive    time.Duration
-	certificate  atomic.Pointer[tls.Certificate]
+	id            uint64
+	addr          string
+	clusterAddr   string
+	serverSecret  []byte
+	clusterSecret []byte
+	serverToken   string // guarded by mu; issued by the primary after joining
+	leader        bool
+	httpClient    *http.Client
+	upgrader      websocket.Upgrader
+	sslCerts      string
+	keepAlive     time.Duration
+	certificate   atomic.Pointer[tls.Certificate]
 
 	refreshMu     sync.Mutex
 	peerDialMu    sync.Mutex
@@ -175,43 +176,61 @@ type peerFrame struct {
 }
 
 type peerLink struct {
-	server   *server
-	peerID   uint64
-	conn     *websocket.Conn
-	send     chan []byte
-	feedback chan []byte
-	incoming chan packet
-	done     chan struct{}
-	once     sync.Once
-	mu       sync.Mutex
-	history  []replayRecord
-	head     int
+	server        *server
+	peerID        uint64
+	conn          *websocket.Conn
+	send          chan []byte
+	incoming      chan packet
+	done          chan struct{}
+	once          sync.Once
+	mu            sync.Mutex
+	history       []replayRecord
+	head          int
+	feedback      [][]byte // guarded by mu; never block routing on feedback
+	feedbackHead  int
+	feedbackBytes int
+	feedbackReady chan struct{}
 }
 
 func main() {
-	listen := flag.String("listen", ":8080", "HTTP or HTTPS listen address")
 	sslCerts := flag.String("ssl_certs", "", "directory containing a TLS certificate and private key")
 	addr := flag.String("addr", "", "public HTTP base URL of this server")
-	clusterAddr := flag.String("clusteraddr", "", "public HTTP base URL of the first server")
+	clusterAddr := flag.String("clusteraddr", "", "primary server URL; omitted starts a leader")
+	clusterSecret := flag.String("cluster_secret", "", "cluster join credential (or CLUSTER_SECRET)")
 	id := flag.Uint64("id", 0, "unique position on the 64-bit hash ring")
 	flag.Parse()
 	secret := os.Getenv("SERVER_SECRET")
 	if secret == "" {
 		secret = os.Getenv("server_secret")
 	}
-	if *addr == "" || *clusterAddr == "" || len(secret) < 32 {
-		log.Fatal("--addr, --clusteraddr, and SERVER_SECRET (at least 32 bytes) are required")
+	if *addr == "" || len(secret) < 32 {
+		log.Fatal("--addr and SERVER_SECRET (at least 32 bytes) are required")
 	}
 	if *id > math.MaxInt64 {
 		log.Fatal("--id must be between 0 and MaxInt64")
 	}
-	for _, raw := range []string{*addr, *clusterAddr} {
-		u, err := url.Parse(raw)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Path != "" || u.RawQuery != "" {
-			log.Fatalf("invalid server URL: %q", raw)
+	listen, err := listenAddress(*addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if *clusterAddr != "" {
+		if _, err := listenAddress(*clusterAddr); err != nil {
+			log.Fatal(err)
 		}
 	}
 	s := newServer(*id, strings.TrimRight(*addr, "/"), strings.TrimRight(*clusterAddr, "/"), []byte(secret))
+	if *clusterSecret == "" {
+		*clusterSecret = os.Getenv("CLUSTER_SECRET")
+	}
+	if *clusterSecret == "" {
+		*clusterSecret = os.Getenv("cluster_secret")
+	}
+	if *clusterSecret != "" {
+		if len(*clusterSecret) < 32 {
+			log.Fatal("cluster_secret must contain at least 32 bytes")
+		}
+		s.clusterSecret = []byte(*clusterSecret)
+	}
 	if value := os.Getenv("TCP_KEEP_ALIVE"); value != "" {
 		interval, err := time.ParseDuration(value + "s")
 		if err != nil || interval <= 0 || interval > time.Duration(math.MaxInt64)-10*time.Second {
@@ -228,10 +247,13 @@ func main() {
 			log.Fatal(err)
 		}
 	}
+	if strings.HasPrefix(s.addr, "https://") && s.sslCerts == "" {
+		log.Fatal("https --addr requires --ssl_certs")
+	}
 	go s.refreshLoop(context.Background(), time.Minute)
 	go s.receiptCleanupLoop(context.Background())
-	log.Printf("listening on %s, ring id %d", *listen, *id)
-	httpServer := &http.Server{Addr: *listen, Handler: s.routes(), ReadHeaderTimeout: 5 * time.Second}
+	log.Printf("listening on %s, ring id %d", listen, *id)
+	httpServer := &http.Server{Addr: listen, Handler: s.routes(), ReadHeaderTimeout: 5 * time.Second}
 	if s.sslCerts != "" {
 		httpServer.TLSConfig = s.tlsConfig()
 		log.Fatal(httpServer.ListenAndServeTLS("", ""))
@@ -239,13 +261,31 @@ func main() {
 	log.Fatal(httpServer.ListenAndServe())
 }
 
+func listenAddress(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return "", errors.New("invalid server address")
+	}
+	port := u.Port()
+	if port == "" {
+		port = "80"
+		if u.Scheme == "https" {
+			port = "443"
+		}
+	}
+	number, err := strconv.Atoi(port)
+	if err != nil || number < 1 || number > 65535 {
+		return "", errors.New("invalid server port")
+	}
+	return ":" + port, nil
+}
+
 func newServer(id uint64, addr, clusterAddr string, secret []byte) *server {
-	authKey := make([]byte, 32)
-	if _, err := rand.Read(authKey); err != nil {
-		panic(err)
+	if clusterAddr == "" {
+		clusterAddr = addr
 	}
 	s := &server{
-		id: id, addr: addr, clusterAddr: clusterAddr, serverSecret: secret, authKey: authKey,
+		id: id, addr: addr, clusterAddr: clusterAddr, serverSecret: secret, clusterSecret: secret,
 		leader:       addr == clusterAddr,
 		httpClient:   &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{MaxIdleConns: 1024, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second}},
 		upgrader:     websocket.Upgrader{ReadBufferSize: 4096, WriteBufferSize: 4096, CheckOrigin: func(*http.Request) bool { return true }},
@@ -254,11 +294,12 @@ func newServer(id uint64, addr, clusterAddr string, secret []byte) *server {
 		peerLinks:    make(map[uint64]*peerLink),
 		allPeerLinks: make(map[*peerLink]struct{}),
 		nodes:        make(map[string]*nodeState),
-		packetPrefix: hex.EncodeToString(authKey[:8]) + "-",
+		packetPrefix: fmt.Sprintf("%x-%x-", id, time.Now().UnixNano()),
 	}
 	if s.leader {
-		s.members[id] = member{peer: peer{ID: id, Addr: addr, AuthKey: authKey}, Seen: time.Now()}
-		s.ring = []peer{{ID: id, Addr: addr, AuthKey: authKey}}
+		s.serverToken = s.serverNodeToken(id)
+		s.members[id] = member{peer: peer{ID: id, Addr: addr, AuthToken: s.serverToken}, Seen: time.Now()}
+		s.ring = []peer{{ID: id, Addr: addr, AuthToken: s.serverToken}}
 		s.epoch = time.Now().UnixNano()
 		s.ringEpoch = s.epoch
 		s.ringVersion = 1
@@ -448,7 +489,7 @@ func (s *server) renew(w http.ResponseWriter, r *http.Request) error {
 		return httpStatus(http.StatusUnauthorized)
 	}
 	c, err := s.verifyTokenSignature(strings.TrimPrefix(authorization, "Bearer "))
-	if err != nil || (c.Expires <= time.Now().Unix() && c.AuthVerifyURL == "") {
+	if err != nil || (c.Expires != 0 && c.Expires <= time.Now().Unix() && c.AuthVerifyURL == "") {
 		return httpStatus(http.StatusUnauthorized)
 	}
 	owner, ok := s.owner(c.NodeID)
@@ -490,6 +531,9 @@ func (s *server) renew(w http.ResponseWriter, r *http.Request) error {
 	}
 	if err := s.verifyAuthorization(r.Context(), c.AuthVerifyURL, "renew"); err != nil {
 		return httpStatus(http.StatusUnauthorized)
+	}
+	if c.Expires == 0 {
+		expires = 0
 	}
 	nonce := make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {
@@ -612,15 +656,20 @@ func (s *server) refresh(w http.ResponseWriter, r *http.Request) error {
 	if !s.leader {
 		return httpStatus(http.StatusNotFound)
 	}
-	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1024))
-	if err != nil || !verifyBody(data, r.Header.Get("X-Cluster-Signature"), s.serverSecret) {
+	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4096))
+	if err != nil || !verifyBody(data, r.Header.Get("X-Server-Signature"), s.serverSecret) {
 		return httpStatus(http.StatusUnauthorized)
 	}
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
 	var p peer
-	if json.Unmarshal(data, &p) != nil || p.ID > math.MaxInt64 || p.Addr == "" || p.Nodes < 0 || len(p.AuthKey) != 32 {
+	if json.Unmarshal(data, &p) != nil || p.ID > math.MaxInt64 || p.Addr == "" || p.Nodes < 0 {
 		return httpStatus(http.StatusBadRequest)
+	}
+	if !verifyBody(data, r.Header.Get("X-Cluster-Signature"), s.clusterSecret) {
+		if err := s.verifyServerNode(r, p.ID); err != nil {
+			return err
+		}
 	}
 	u, err := url.Parse(p.Addr)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Path != "" || u.RawQuery != "" {
@@ -631,6 +680,7 @@ func (s *server) refresh(w http.ResponseWriter, r *http.Request) error {
 		s.mu.Unlock()
 		return httpStatus(http.StatusConflict)
 	}
+	p.AuthToken = s.serverNodeToken(p.ID)
 	s.members[p.ID] = member{peer: p, Seen: time.Now()}
 	snapshot := s.snapshotLocked()
 	s.version++
@@ -720,7 +770,7 @@ func (s *server) refreshOnce(ctx context.Context) error {
 	defer s.refreshMu.Unlock()
 	if s.leader {
 		s.mu.Lock()
-		s.members[s.id] = member{peer: peer{ID: s.id, Addr: s.addr, Nodes: s.nodeCount.Load(), AuthKey: s.authKey}, Seen: time.Now()}
+		s.members[s.id] = member{peer: peer{ID: s.id, Addr: s.addr, Nodes: s.nodeCount.Load(), AuthToken: s.serverToken}, Seen: time.Now()}
 		snapshot := s.snapshotLocked()
 		s.version++
 		version := s.version
@@ -731,12 +781,19 @@ func (s *server) refreshOnce(ctx context.Context) error {
 		}
 		return nil
 	}
-	data, _ := json.Marshal(peer{ID: s.id, Addr: s.addr, Nodes: s.nodeCount.Load(), AuthKey: s.authKey})
+	s.mu.RLock()
+	token := s.serverToken
+	s.mu.RUnlock()
+	data, _ := json.Marshal(peer{ID: s.id, Addr: s.addr, Nodes: s.nodeCount.Load(), AuthToken: token})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.clusterAddr+"/refresh", bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
-	req.Header.Set("X-Cluster-Signature", signBody(data, s.serverSecret))
+	req.Header.Set("X-Cluster-Signature", signBody(data, s.clusterSecret))
+	req.Header.Set("X-Server-Signature", signBody(data, s.serverSecret))
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return err
@@ -786,13 +843,19 @@ func (s *server) applySnapshot(snapshot []peer, epoch int64, version uint64) boo
 	changed := len(snapshot) != len(s.ring)
 	if !changed {
 		for i := range snapshot {
-			if snapshot[i].ID != s.ring[i].ID || snapshot[i].Addr != s.ring[i].Addr || !bytes.Equal(snapshot[i].AuthKey, s.ring[i].AuthKey) {
+			if snapshot[i].ID != s.ring[i].ID || snapshot[i].Addr != s.ring[i].Addr || snapshot[i].AuthToken != s.ring[i].AuthToken {
 				changed = true
 				break
 			}
 		}
 	}
 	s.ring = snapshot
+	for _, p := range snapshot {
+		if p.ID == s.id {
+			s.serverToken = p.AuthToken
+			break
+		}
+	}
 	var moved []struct {
 		cl   *client
 		addr string
@@ -1243,22 +1306,36 @@ func decodePacket(data []byte) (packet, error) {
 	return p, err
 }
 
-func (s *server) peerKey(id uint64) ([]byte, bool) {
+func (s *server) peerToken(id uint64) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	i := sort.Search(len(s.ring), func(i int) bool { return s.ring[i].ID >= id })
 	if i == len(s.ring) || s.ring[i].ID != id {
-		return nil, false
+		return "", false
 	}
-	return s.ring[i].AuthKey, true
+	return s.ring[i].AuthToken, true
 }
 
 func (s *server) signToken(c claims) string {
 	data, _ := json.Marshal(c)
 	payload := base64.RawURLEncoding.EncodeToString(data)
-	mac := hmac.New(sha256.New, s.authKey)
+	mac := hmac.New(sha256.New, s.serverSecret)
 	mac.Write([]byte(payload))
 	return payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func (s *server) serverNodeToken(id uint64) string {
+	return s.signToken(claims{Issuer: s.id, NodeID: fmt.Sprintf("%032x", id), XSrcID: strconv.FormatUint(id, 10), NodeType: "server", RP5: 10})
+}
+
+func (s *server) verifyServerNode(r *http.Request, id uint64) error {
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	knownToken, known := s.peerToken(id)
+	c, err := s.verifyToken(token)
+	if err != nil || !known || c.NodeType != "server" || c.Expires != 0 || c.NodeID != fmt.Sprintf("%032x", id) || !hmac.Equal([]byte(token), []byte(knownToken)) {
+		return httpStatus(http.StatusUnauthorized)
+	}
+	return nil
 }
 
 func (s *server) verifyToken(token string) (claims, error) {
@@ -1266,7 +1343,7 @@ func (s *server) verifyToken(token string) (claims, error) {
 	if err != nil {
 		return claims{}, err
 	}
-	if c.Expires <= time.Now().Unix() {
+	if c.Expires != 0 && c.Expires <= time.Now().Unix() {
 		return claims{}, errors.New("expired token")
 	}
 	return c, nil
@@ -1282,7 +1359,7 @@ func (s *server) verifyTokenSignature(token string) (claims, error) {
 		return claims{}, err
 	}
 	var c claims
-	if json.Unmarshal(data, &c) != nil || len(c.NodeID) != 32 || len(c.XSrcID) == 0 || len(c.XSrcID) > 256 || (c.NodeType != "" && c.NodeType != "node" && c.NodeType != "server") || c.Expires <= 0 || len(c.AuthVerifyURL) > 2048 || c.RP5 < 0 {
+	if json.Unmarshal(data, &c) != nil || len(c.NodeID) != 32 || len(c.XSrcID) == 0 || len(c.XSrcID) > 256 || (c.NodeType != "" && c.NodeType != "node" && c.NodeType != "server") || (c.Expires < 0 || (c.Expires == 0 && c.NodeType != "server")) || len(c.AuthVerifyURL) > 2048 || c.RP5 < 0 {
 		return claims{}, errors.New("invalid claims")
 	}
 	if c.RP5 == 0 {
@@ -1291,15 +1368,11 @@ func (s *server) verifyTokenSignature(token string) (claims, error) {
 	if _, err := hex.DecodeString(c.NodeID); err != nil {
 		return claims{}, err
 	}
-	key, ok := s.peerKey(c.Issuer)
-	if !ok {
-		return claims{}, errors.New("unknown token issuer")
-	}
 	got, err := base64.RawURLEncoding.DecodeString(signature)
 	if err != nil {
 		return claims{}, err
 	}
-	mac := hmac.New(sha256.New, key)
+	mac := hmac.New(sha256.New, s.serverSecret)
 	mac.Write([]byte(payload))
 	if !hmac.Equal(got, mac.Sum(nil)) {
 		return claims{}, errors.New("invalid signature")
@@ -1367,9 +1440,11 @@ func (s *server) verifyAuthorization(ctx context.Context, rawURL, action string)
 
 func (s *server) peer(w http.ResponseWriter, r *http.Request) error {
 	id, err := strconv.ParseUint(r.Header.Get("X-Server-ID"), 10, 64)
-	key, known := s.peerKey(id)
-	if err != nil || !known || id == s.id || !verifyBody([]byte("GET /peer"), r.Header.Get("X-Server-Signature"), key) {
+	if err != nil || id == s.id {
 		return httpStatus(http.StatusUnauthorized)
+	}
+	if err := s.verifyServerNode(r, id); err != nil {
+		return err
 	}
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -1395,7 +1470,10 @@ func (s *server) getPeerLink(owner peer) (*peerLink, error) {
 	address := "ws" + strings.TrimPrefix(owner.Addr, "http") + "/peer"
 	headers := http.Header{}
 	headers.Set("X-Server-ID", strconv.FormatUint(s.id, 10))
-	headers.Set("X-Server-Signature", signBody([]byte("GET /peer"), s.authKey))
+	s.mu.RLock()
+	token := s.serverToken
+	s.mu.RUnlock()
+	headers.Set("Authorization", "Bearer "+token)
 	conn, resp, err := (&websocket.Dialer{Proxy: http.ProxyFromEnvironment, HandshakeTimeout: 10 * time.Second}).Dial(address, headers)
 	if err != nil {
 		if resp != nil {
@@ -1407,7 +1485,7 @@ func (s *server) getPeerLink(owner peer) (*peerLink, error) {
 }
 
 func (s *server) addPeerLink(peerID uint64, conn *websocket.Conn) *peerLink {
-	link := &peerLink{server: s, peerID: peerID, conn: conn, send: make(chan []byte, 4096), feedback: make(chan []byte, 4096), incoming: make(chan packet, 4096), done: make(chan struct{})}
+	link := &peerLink{server: s, peerID: peerID, conn: conn, send: make(chan []byte, 4096), feedbackReady: make(chan struct{}, 1), incoming: make(chan packet, 4096), done: make(chan struct{})}
 	s.peerMu.Lock()
 	old := s.peerLinks[link.peerID]
 	if old == nil {
@@ -1442,20 +1520,51 @@ func (link *peerLink) enqueue(ctx context.Context, p packet) error {
 		return errors.New("peer link closed")
 	default:
 	}
+	if p.Type == "status" {
+		// Blocking here can fill both peers' routing queues and stop reads/pongs.
+		if link.feedbackBytes+len(data) > 64<<20 {
+			link.mu.Unlock()
+			return errors.New("peer feedback queue full")
+		}
+		link.recordLocked(p, time.Now())
+		link.feedback = append(link.feedback, data)
+		link.feedbackBytes += len(data)
+		link.mu.Unlock()
+		select {
+		case link.feedbackReady <- struct{}{}:
+		default:
+		}
+		return nil
+	}
 	link.recordLocked(p, time.Now())
 	link.mu.Unlock()
-	queue := link.send
-	if p.Type == "status" {
-		queue = link.feedback
-	}
 	select {
 	case <-link.done:
 		return errors.New("peer link closed")
 	case <-ctx.Done():
 		return ctx.Err()
-	case queue <- data:
+	case link.send <- data:
 		return nil
 	}
+}
+
+func (link *peerLink) takeFeedback() []byte {
+	link.mu.Lock()
+	defer link.mu.Unlock()
+	if link.feedbackHead == len(link.feedback) {
+		return nil
+	}
+	data := link.feedback[link.feedbackHead]
+	link.feedback[link.feedbackHead] = nil
+	link.feedbackHead++
+	link.feedbackBytes -= len(data)
+	if link.feedbackHead == len(link.feedback) {
+		link.feedback, link.feedbackHead = nil, 0
+	} else if link.feedbackHead > 1024 && link.feedbackHead*2 >= len(link.feedback) {
+		link.feedback = append([][]byte(nil), link.feedback[link.feedbackHead:]...)
+		link.feedbackHead = 0
+	}
+	return data
 }
 
 func (link *peerLink) readLoop() {
@@ -1511,15 +1620,15 @@ func (link *peerLink) writeLoop() {
 		case <-ticker.C:
 			kind = websocket.PingMessage
 		default:
-			select {
-			case data = <-link.feedback:
-			default:
+			data = link.takeFeedback()
+			if data == nil {
 				select {
 				case <-link.done:
 					return
 				case <-ticker.C:
 					kind = websocket.PingMessage
-				case data = <-link.feedback:
+				case <-link.feedbackReady:
+					continue
 				case data = <-link.send:
 				}
 			}
@@ -1560,6 +1669,7 @@ func (link *peerLink) close() {
 		link.history, link.head = pruneHistory(link.history, link.head, time.Now().Add(-3*time.Second))
 		replay := append([]replayRecord(nil), link.history[link.head:]...)
 		link.history, link.head = nil, 0
+		link.feedback, link.feedbackHead, link.feedbackBytes = nil, 0, 0
 		link.mu.Unlock()
 		if len(replay) != 0 {
 			go func() {
