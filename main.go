@@ -58,6 +58,7 @@ type claims struct {
 	AuthVerifyURL string `json:"auth_verify_url,omitempty"`
 	Nonce         string `json:"nonce,omitempty"`
 	Expires       int64  `json:"expires"`
+	RP5           int64  `json:"rp5"`
 }
 
 type packet struct {
@@ -118,6 +119,9 @@ type client struct {
 	xSrcID       string
 	nodeType     string
 	keepAlive    time.Duration
+	rp5          int64
+	rateBucket   int64 // readLoop owns the per-connection bucket and counter
+	rateCount    int64
 	sent         []replayRecord // guarded by state.mu
 	sentHead     int
 	normalClose  atomic.Bool
@@ -402,8 +406,10 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) error {
 		NodeType      string `json:"node_type"`
 		ValidFor      *int64 `json:"valid_for"`
 		AuthVerifyURL string `json:"auth_verify_url"`
+		RP5           int64  `json:"rp5"`
 	}
-	if err != nil || json.Unmarshal(body, &req) != nil || len(req.XSrcID) == 0 || len(req.XSrcID) > 256 || (req.NodeType != "" && req.NodeType != "node" && req.NodeType != "server") {
+	req.RP5 = 10
+	if err != nil || json.Unmarshal(body, &req) != nil || len(req.XSrcID) == 0 || len(req.XSrcID) > 256 || req.RP5 <= 0 || (req.NodeType != "" && req.NodeType != "node" && req.NodeType != "server") {
 		return httpStatus(http.StatusBadRequest)
 	}
 	if req.NodeType == "server" && !verifyBody(body, r.Header.Get("X-Cluster-Signature"), s.serverSecret) {
@@ -425,10 +431,10 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) error {
 	if req.NodeType == "" {
 		req.NodeType = "node"
 	}
-	c := claims{Issuer: s.id, NodeID: hex.EncodeToString(id), XSrcID: req.XSrcID, NodeType: req.NodeType, Expires: expires, AuthVerifyURL: req.AuthVerifyURL}
+	c := claims{Issuer: s.id, NodeID: hex.EncodeToString(id), XSrcID: req.XSrcID, NodeType: req.NodeType, Expires: expires, AuthVerifyURL: req.AuthVerifyURL, RP5: req.RP5}
 	token := s.signToken(c)
 	w.Header().Set("Content-Type", "application/json")
-	result := map[string]any{"node_id": c.NodeID, "node_type": c.NodeType, "token": token, "expires": c.Expires}
+	result := map[string]any{"node_id": c.NodeID, "node_type": c.NodeType, "token": token, "expires": c.Expires, "rp5": c.RP5}
 	if owner, ok := s.owner(c.NodeID); ok {
 		result["address"] = owner.Addr
 	}
@@ -495,7 +501,7 @@ func (s *server) renew(w http.ResponseWriter, r *http.Request) error {
 	token := s.signToken(c)
 	s.disconnectNode(c.NodeID)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"node_id": c.NodeID, "node_type": c.NodeType, "token": token, "expires": c.Expires})
+	json.NewEncoder(w).Encode(map[string]any{"node_id": c.NodeID, "node_type": c.NodeType, "token": token, "expires": c.Expires, "rp5": c.RP5})
 	return nil
 }
 
@@ -581,7 +587,7 @@ func (s *server) connect(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return nil
 	}
-	cl := &client{conn: conn, nodeID: c.NodeID, xSrcID: c.XSrcID, nodeType: c.NodeType, keepAlive: keepAlive, send: make(chan outbound, 4096), done: make(chan struct{}), server: s}
+	cl := &client{conn: conn, nodeID: c.NodeID, xSrcID: c.XSrcID, nodeType: c.NodeType, rp5: c.RP5, keepAlive: keepAlive, send: make(chan outbound, 4096), done: make(chan struct{}), server: s}
 	s.mu.Lock()
 	state := s.nodes[c.NodeID]
 	if state == nil {
@@ -1034,12 +1040,16 @@ func (cl *client) readLoop() {
 			p.Src, p.XSrc = cl.nodeID, cl.xSrcID
 			p.SrcNodeID = cl.nodeID
 		}
-		if cl.nodeType != "server" || p.Timestamp == nil {
-			now := time.Now().UnixMilli()
+		now := time.Now().UnixMilli()
+		if p.Timestamp == nil {
 			p.Timestamp = &now
 		}
 		if p.PacketID == "" {
 			p.PacketID = cl.server.packetPrefix + strconv.FormatUint(cl.server.nextPacketID.Add(1), 36)
+		}
+		if reason := cl.admit(p, now); reason != "" {
+			cl.drop(p, data, reason)
+			continue
 		}
 		size := int64(len(data))
 		if cl.pendingBytes.Add(size) > 4<<20 {
@@ -1053,6 +1063,35 @@ func (cl *client) readLoop() {
 			return
 		}
 	}
+}
+
+func (cl *client) admit(p packet, now int64) string {
+	if cl.nodeType == "server" {
+		return ""
+	}
+	bucket := now / 5000
+	if bucket != cl.rateBucket {
+		cl.rateBucket, cl.rateCount = bucket, 0
+	}
+	if cl.rateCount >= cl.rp5 {
+		return "rate_limited"
+	}
+	cl.rateCount++
+	if p.Timestamp != nil && (*p.Timestamp < now-8000 || *p.Timestamp > now) {
+		return "invalid_time"
+	}
+	return ""
+}
+
+func (cl *client) drop(p packet, original []byte, reason string) {
+	var fields map[string]json.RawMessage
+	json.Unmarshal(original, &fields)
+	p.Type, p.Payload = "drop", reason
+	updated, _ := json.Marshal(p)
+	// Merge canonical fields while retaining any extra fields from the input.
+	json.Unmarshal(updated, &fields)
+	data, _ := json.Marshal(fields)
+	cl.enqueue(outbound{data: data})
 }
 
 func (cl *client) routeLoop(jobs <-chan routedPacket) {
@@ -1243,8 +1282,11 @@ func (s *server) verifyTokenSignature(token string) (claims, error) {
 		return claims{}, err
 	}
 	var c claims
-	if json.Unmarshal(data, &c) != nil || len(c.NodeID) != 32 || len(c.XSrcID) == 0 || len(c.XSrcID) > 256 || (c.NodeType != "" && c.NodeType != "node" && c.NodeType != "server") || c.Expires <= 0 || len(c.AuthVerifyURL) > 2048 {
+	if json.Unmarshal(data, &c) != nil || len(c.NodeID) != 32 || len(c.XSrcID) == 0 || len(c.XSrcID) > 256 || (c.NodeType != "" && c.NodeType != "node" && c.NodeType != "server") || c.Expires <= 0 || len(c.AuthVerifyURL) > 2048 || c.RP5 < 0 {
 		return claims{}, errors.New("invalid claims")
+	}
+	if c.RP5 == 0 {
+		c.RP5 = 10
 	}
 	if _, err := hex.DecodeString(c.NodeID); err != nil {
 		return claims{}, err

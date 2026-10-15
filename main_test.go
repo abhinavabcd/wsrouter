@@ -61,9 +61,13 @@ func startCluster(t *testing.T, count int) ([]*server, []*httptest.Server) {
 	return servers, httpServers
 }
 
-func createNode(t *testing.T, baseURL, xSrc string) testNode {
+func createNode(t *testing.T, baseURL, xSrc string, rp5 ...int64) testNode {
 	t.Helper()
-	body, _ := json.Marshal(map[string]string{"x_src_id": xSrc})
+	req := map[string]any{"x_src_id": xSrc}
+	if len(rp5) != 0 {
+		req["rp5"] = rp5[0]
+	}
+	body, _ := json.Marshal(req)
 	resp, err := http.Post(baseURL+"/create", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -177,6 +181,7 @@ func TestMessageTimestampAcrossServers(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.NodeType = "server"
+	c.RP5 = 1 // Server connections bypass the rate limit as well as time checks.
 	serverToken := servers[0].signToken(c)
 	nodeConn := connectNode(t, sourceOwner.Addr, source.token, "")
 	serverConn := connectNode(t, sourceOwner.Addr, serverToken, "")
@@ -189,13 +194,19 @@ func TestMessageTimestampAcrossServers(t *testing.T) {
 		}
 	}
 	for _, nodeType := range []string{"node", "server"} {
-		for _, supplied := range []string{"missing", "zero", "existing"} {
+		for _, supplied := range []string{"missing", "zero", "existing", "valid", "future", "missing-again"} {
 			t.Run(nodeType+"/"+supplied, func(t *testing.T) {
 				p := packet{PacketID: nodeType + "-" + supplied, Type: "data", Dest: dest.id, Payload: "hello"}
-				if supplied != "missing" {
+				if !strings.HasPrefix(supplied, "missing") {
 					value := int64(0)
 					if supplied == "existing" {
 						value = 1700000000123
+					}
+					if supplied == "valid" {
+						value = time.Now().UnixMilli() - 1000
+					}
+					if supplied == "future" {
+						value = time.Now().UnixMilli() + 60000
 					}
 					p.Timestamp = &value
 				}
@@ -209,6 +220,18 @@ func TestMessageTimestampAcrossServers(t *testing.T) {
 				if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
 					t.Fatal(err)
 				}
+				if nodeType == "node" && (supplied == "zero" || supplied == "existing" || supplied == "future") {
+					nodeConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+					_, raw, err := nodeConn.ReadMessage()
+					if err != nil {
+						t.Fatal(err)
+					}
+					got, err := decodePacket(raw)
+					if err != nil || got.Type != "drop" || got.Payload != "invalid_time" || got.PacketID != p.PacketID || got.Timestamp == nil || *got.Timestamp != *p.Timestamp || got.Dest != dest.id {
+						t.Fatalf("invalid timestamp was not echoed as a drop: %+v, %v", got, err)
+					}
+					return
+				}
 				destConn.SetReadDeadline(time.Now().Add(3 * time.Second))
 				_, raw, err := destConn.ReadMessage()
 				if err != nil {
@@ -218,12 +241,23 @@ func TestMessageTimestampAcrossServers(t *testing.T) {
 				if err != nil || got.Timestamp == nil || got.PacketID != p.PacketID {
 					t.Fatalf("missing timestamp or wrong packet: %+v, %v", got, err)
 				}
-				if nodeType == "server" && p.Timestamp != nil {
+				if p.Timestamp != nil {
 					if *got.Timestamp != *p.Timestamp {
 						t.Fatalf("server timestamp changed: got %d, want %d", *got.Timestamp, *p.Timestamp)
 					}
 				} else if *got.Timestamp < before || *got.Timestamp > time.Now().UnixMilli() {
 					t.Fatalf("timestamp %d is not the server's receive time", *got.Timestamp)
+				}
+				for _, feedbackConn := range []*websocket.Conn{nodeConn, serverConn} {
+					feedbackConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+					_, raw, err := feedbackConn.ReadMessage()
+					if err != nil {
+						t.Fatal(err)
+					}
+					feedback, err := decodePacket(raw)
+					if err != nil || feedback.Type != "status" || feedback.PacketID != p.PacketID || feedback.Payload != "success" {
+						t.Fatalf("wrong timestamp feedback: %+v, %v", feedback, err)
+					}
 				}
 			})
 		}
@@ -469,7 +503,7 @@ func TestStressFiveServers(t *testing.T) {
 	ids := make([]string, count)
 	idIndex := make(map[string]int, count)
 	for i := range nodes {
-		node := createNode(t, urls[i%5].URL, fmt.Sprintf("account-%d", i))
+		node := createNode(t, urls[i%5].URL, fmt.Sprintf("account-%d", i), int64(count))
 		ids[i], nodes[i].id, nodes[i].token = node.id, node.id, node.token
 		idIndex[node.id] = i
 	}

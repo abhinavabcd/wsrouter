@@ -39,7 +39,7 @@ Run the reload request on each server whose certificate files changed. Without `
 
 ## Client flow
 
-1. `POST /create` with JSON `{"x_src_id":"your-client-id"}`. The response contains `node_id`, `node_type`, `token`, Unix `expires`, and the current owner `address` when the ring is available. Tokens identify the server that issued them. Add `"valid_for":3600` to set the lifetime in seconds; if omitted, the lifetime is 90 days (`7776000` seconds). `valid_for` must be positive.
+1. `POST /create` with JSON `{"x_src_id":"your-client-id"}`. The response contains `node_id`, `node_type`, `token`, Unix `expires`, `rp5`, and the current owner `address` when the ring is available. Tokens identify the server that issued them. Add `"valid_for":3600` to set the lifetime in seconds; if omitted, the lifetime is 90 days (`7776000` seconds). `valid_for` must be positive. Add `"rp5":100` to allow 100 incoming packets per five-second bucket per connection; the default is 10.
 2. Open `GET /connect?token=TOKEN` as a WebSocket, or send `Authorization: Bearer TOKEN` on the upgrade request. A wrong server returns HTTP `421` and JSON `{"address":"http://owner:port"}`. Retry at that address with the same token, converting `http` to `ws` or `https` to `wss`. Browser WebSocket APIs cannot read the `421` response body; browsers can call `GET /locate` with `Authorization: Bearer TOKEN` to obtain the current `address` via CORS before retrying.
 3. `POST /renew` with `Authorization: Bearer TOKEN`. Any server accepts the request and proxies it to the node's current ring owner, which issues a fresh token for the same node ID and node type and disconnects all existing sockets for that node before returning success. Reconnect with the returned token. Without an external verifier, renew before expiry. Tokens carrying `auth_verify_url` can also be renewed after expiry if that verifier approves. The optional JSON body `{"valid_for":3600}` sets its new lifetime; the default is 90 days. Keep the newest token for reconnects.
 4. Send JSON packets as WebSocket **text** messages. Regular nodes (`node_type` omitted or `"node"`) leave `src_id` and `x_src_id` out; the router fills them from the verified token and sets `src_node_id` to the authenticated node ID, replacing any supplied `src_node_id`. Supply `_id` if you already have one; otherwise the router assigns one.
@@ -67,7 +67,7 @@ Example delivered packet:
 
 The server assigns `_id` only when it is absent or empty, and preserves a supplied value during forwarding and replay.
 
-Messages also carry `timestamp`, an integer Unix time in milliseconds. For regular node messages, the router sets this to its receive time, replacing any supplied value. For server-token messages and peer forwarding, an existing timestamp (including zero) is preserved; a missing or null timestamp is filled with the current time. Fanout copies and replays retain the original timestamp. Router-generated feedback carries its own creation timestamp.
+Messages also carry `timestamp`, an integer Unix time in milliseconds. A regular node may supply a timestamp in the inclusive range from the server's receive time minus 8,000 milliseconds to the server's receive time. An accepted timestamp is preserved. Older timestamps and future timestamps produce a `drop` response with `payload: "invalid_time"`. For server-token messages and peer forwarding, any existing timestamp (including zero) is preserved without a drift check. A missing or null timestamp is filled with the current time. Fanout copies and replays retain the original timestamp. Router-generated feedback carries its own creation timestamp.
 
 The router sends feedback to the source using the same ring:
 
@@ -84,6 +84,24 @@ Example failure feedback:
 ```
 
 WebSocket origins from any domain are accepted. HTTP routes send `Access-Control-Allow-Origin: *` and answer CORS preflight requests. The service uses bearer tokens, not cookies. `/create` accepts the caller's `x_src_id` as supplied; if that value represents a trusted account, authenticate callers at a gateway.
+
+### Rate limits and dropped packets
+
+Set a positive integer `rp5` when issuing the token through `/create` (the existing endpoint previously called `/generate`):
+
+```json
+{"x_src_id":"account-42","rp5":100,"valid_for":3600}
+```
+
+`rp5` is included in the signed claims and retained during renewal. Tokens issued before this field existed default to 10. Each regular-node socket has its own counter for the server-time bucket `UnixMilli / 5000`; changing the packet timestamp cannot reset it. Counters reset lazily on the first packet in a new bucket, without a per-connection timer. One incoming packet consumes one allowance, including a packet with an invalid timestamp; a packet containing multiple destinations still counts once. Once the allowance is exhausted, additional packets produce `payload: "rate_limited"` before timestamp validation. Server-token sockets and cluster peer links bypass both the rate limit and timestamp drift check.
+
+Rejected packets are returned only to the sending socket, with `type` replaced by `drop` and `payload` replaced by the reason. The original `_id`, timestamp, destination fields, and extra JSON fields are copied; missing IDs and timestamps are assigned normally, and source identity is filled from the authenticated token. The packet is not routed and produces no destination delivery feedback. A drop leaves the socket open so the node can send again when its next bucket starts.
+
+```json
+{"_id":"message-42","type":"drop","payload":"invalid_time","timestamp":1700000000000,"dest_node_id":"destination","src_id":"sender","src_node_id":"sender","x_src_id":"account-42"}
+```
+
+The same format is used with `payload: "rate_limited"` for excess traffic. Because these are fixed wall-clock buckets, a connection can use an allowance at the end of one bucket and a fresh allowance immediately after the boundary.
 
 ### External authorization and expired-token renewal
 
@@ -120,4 +138,4 @@ go test -race ./...
 WSROUTER_STRESS=1 go test -run TestStressFiveServers -count=1 -v -timeout=10m
 ```
 
-The opt-in stress test starts five servers and creates 1,000 clients total, 200 through each server. Half the clients send one batch to the other 999 destinations in random order; the other half send individual packets. The test waits for all 999,000 data packets and 999,000 `success` statuses, checking sender identity and payload while deduplicating replayed packets by their preserved `_id`. It advances receipt expiry in the test harness before disconnecting all clients, so teardown does not generate another million expected `failed` notices. For a smaller local smoke run, set `WSROUTER_STRESS_NODES=50` alongside `WSROUTER_STRESS=1`.
+The opt-in stress test starts five servers and creates 1,000 clients total, 200 through each server, with an explicit `rp5` allowance equal to the client count so the throughput test does not exercise the default limit of 10. Half the clients send one batch to the other 999 destinations in random order; the other half send individual packets. The test waits for all 999,000 data packets and 999,000 `success` statuses, checking sender identity and payload while deduplicating replayed packets by their preserved `_id`. It advances receipt expiry in the test harness before disconnecting all clients, so teardown does not generate another million expected `failed` notices. For a smaller local smoke run, set `WSROUTER_STRESS_NODES=50` alongside `WSROUTER_STRESS=1`.
