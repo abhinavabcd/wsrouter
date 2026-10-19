@@ -230,3 +230,52 @@ func TestCommonPEMCertificateNames(t *testing.T) {
 		})
 	}
 }
+
+func TestCertificateWatcherFollowsAtomicPublication(t *testing.T) {
+	dir := t.TempDir()
+	for i, name := range []string{"first", "second"} {
+		_, cert, key := testCertificate(t, int64(i+1))
+		version := filepath.Join(dir, name)
+		if err := os.Mkdir(version, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(version, "server.pem"), cert, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(version, "server.key"), key, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	current := filepath.Join(dir, "current")
+	if err := os.Symlink("first", current); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{sslCerts: current}
+	if err := s.reloadCertificate(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); s.watchCertificate(ctx, 10*time.Millisecond) }()
+	defer func() { cancel(); <-done }()
+	if err := os.Symlink("second", filepath.Join(dir, "next")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "next"), current); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		cert, err := x509.ParseCertificate(s.certificate.Load().Certificate[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cert.SerialNumber.Int64() == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("watcher did not load newly published certificate")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}

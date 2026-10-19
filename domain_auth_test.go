@@ -30,16 +30,16 @@ func TestDomainCredentialHTTPSVerification(t *testing.T) {
 	nodeID = strings.TrimPrefix(backend.URL, "https://") + "|random"
 	token := "/verify?account=42&node_id=wrong&node_id=duplicate|" + secret
 	s := &server{addr: "https://node.router.example", httpClient: backend.Client()}
-	c, err := s.authenticate(context.Background(), nodeID, token, "")
+	c, err := s.authenticate(context.Background(), nodeID, token, "", "")
 	if err != nil || c.NodeID != nodeID || c.Token != token || c.XSrcID != nodeID || c.RP5 != 10 || c.NodeType != "node" {
 		t.Fatalf("authentication: %+v, %v", c, err)
 	}
-	c, err = s.authenticate(context.Background(), nodeID, token, "renew")
+	c, err = s.authenticate(context.Background(), nodeID, token, "renew", "")
 	if err != nil || c.XSrcID != "account-42" || c.RP5 != 25 || !strings.HasSuffix(c.Token, "|rotated") {
 		t.Fatalf("renewal: %+v, %v", c, err)
 	}
 	s.httpClient = &http.Client{}
-	if _, err = s.authenticate(context.Background(), nodeID, token, ""); err == nil {
+	if _, err = s.authenticate(context.Background(), nodeID, token, "", ""); err == nil {
 		t.Fatal("untrusted certificate accepted")
 	}
 }
@@ -48,7 +48,7 @@ func TestDomainCredentialDenials(t *testing.T) {
 	for _, body := range []string{"ok", "denied", "okay", `{"valid":false,"rp5":10}`, `{"valid":"false","rp5":10}`, `{"valid":"true","rp5":0}`, `{"valid":true}`, `{"valid":"true","rp5":10,"expires":1}`, strings.Repeat("x", 8193)} {
 		backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, body) }))
 		s := &server{addr: "https://router.example", httpClient: backend.Client()}
-		_, err := s.authenticate(context.Background(), strings.TrimPrefix(backend.URL, "https://")+"|id", "/verify|secret", "")
+		_, err := s.authenticate(context.Background(), strings.TrimPrefix(backend.URL, "https://")+"|id", "/verify|secret", "", "")
 		backend.Close()
 		if err == nil {
 			t.Fatal("denial accepted")
@@ -57,7 +57,7 @@ func TestDomainCredentialDenials(t *testing.T) {
 	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, "/approved", 302) }))
 	defer backend.Close()
 	s := &server{addr: "https://router.example", httpClient: backend.Client()}
-	if _, err := s.authenticate(context.Background(), strings.TrimPrefix(backend.URL, "https://")+"|id", "/verify|secret", ""); err == nil {
+	if _, err := s.authenticate(context.Background(), strings.TrimPrefix(backend.URL, "https://")+"|id", "/verify|secret", "", ""); err == nil {
 		t.Fatal("redirect accepted")
 	}
 }

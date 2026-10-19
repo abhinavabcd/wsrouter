@@ -56,7 +56,7 @@ func TestRenewAtOwnerClosesOnlyRenewedNode(t *testing.T) {
 	}
 }
 
-func TestRenewProxyReturnsOwnerDenialWithoutDisconnect(t *testing.T) {
+func TestRenewAtNonOwnerReturnsVerifierDenialWithoutDisconnect(t *testing.T) {
 	servers, urls := startCluster(t, 2)
 	node := createNode(t, urls[0].URL, "account")
 	owner, _ := servers[0].owner(node.id)
@@ -80,7 +80,7 @@ func TestRenewProxyReturnsOwnerDenialWithoutDisconnect(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized || string(body) != "Unauthorized\n" || resp.Header.Get("Content-Type") != "text/plain; charset=utf-8" || account.renewCalls != 1 {
-		t.Fatalf("owner denial not proxied: %s %s, calls=%d", resp.Status, body, account.renewCalls)
+		t.Fatalf("unexpected verifier denial: %s %s, calls=%d", resp.Status, body, account.renewCalls)
 	}
 	waitConnections(t, servers[ownerIndex], node.id, 1)
 	data, _ := encodePacket(packet{Type: "data", Dest: node.id, Payload: "denial-kept-socket"})
@@ -93,29 +93,26 @@ func TestRenewProxyReturnsOwnerDenialWithoutDisconnect(t *testing.T) {
 	}
 }
 
-func TestRenewProxyBoundsRingDisagreement(t *testing.T) {
-	servers, urls := startCluster(t, 2)
+func TestRenewWithoutRing(t *testing.T) {
+	servers, urls := startCluster(t, 1)
 	node := createNode(t, urls[0].URL, "account")
-	owner, _ := servers[0].owner(node.id)
-	for i, s := range servers {
-		s.mu.Lock()
-		for j := range s.ring {
-			if s.ring[j].ID == owner.ID {
-				s.ring[j].Addr = urls[1-i].URL
-			}
-		}
-		s.mu.Unlock()
-	}
+	servers[0].mu.Lock()
+	servers[0].ring = nil
+	servers[0].mu.Unlock()
 	req, _ := http.NewRequest(http.MethodPost, urls[0].URL+"/renew", nil)
 	req.Header.Set("Authorization", "Bearer "+node.token)
 	req.Header.Set("X-Node-ID", node.id)
-	resp, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusLoopDetected {
-		t.Fatalf("disagreeing rings returned %s", resp.Status)
+	defer resp.Body.Close()
+	var renewed domainIdentity
+	if err := json.NewDecoder(resp.Body).Decode(&renewed); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK || renewed.NodeID != node.id || renewed.Token != node.token {
+		t.Fatalf("renewal without ring: %s, %+v", resp.Status, renewed)
 	}
 }
 

@@ -245,10 +245,10 @@ func TestTwoServerRoutingKeysAndCORS(t *testing.T) {
 	for owner, _ := leader.owner(dest.id); owner.Addr != followerURL; owner, _ = leader.owner(dest.id) {
 		dest = createNode(t, leaderURL, "dest-account")
 	}
-	if _, err := leader.authenticate(context.Background(), source.id, source.token, ""); err != nil {
+	if _, err := leader.authenticate(context.Background(), source.id, source.token, "", ""); err != nil {
 		t.Fatalf("leader rejected follower-issued token: %v", err)
 	}
-	if _, err := follower.authenticate(context.Background(), dest.id, dest.token, ""); err != nil {
+	if _, err := follower.authenticate(context.Background(), dest.id, dest.token, "", ""); err != nil {
 		t.Fatalf("follower rejected leader-issued token: %v", err)
 	}
 	if leader.ring[1].AuthToken != follower.serverToken || follower.ring[0].AuthToken != leader.serverToken {
@@ -395,21 +395,25 @@ func TestRenewOnDifferentServer(t *testing.T) {
 	if renewed.NodeID != node.id || renewed.Token != node.token {
 		t.Fatal("unexpected renewal identity")
 	}
-	for _, conn := range []*websocket.Conn{first, second} {
-		conn.SetReadDeadline(time.Now().Add(time.Second))
-		if _, _, err := conn.ReadMessage(); err == nil || os.IsTimeout(err) {
-			t.Fatalf("renew did not disconnect an existing socket: %v", err)
-		}
-	}
-	if servers[ownerIndex].nodeCount.Load() != 0 {
-		t.Fatal("disconnected node remains counted")
-	}
+	waitConnections(t, servers[ownerIndex], node.id, 2)
 	newConn := connectNode(t, owner.Addr, renewed.Token, "")
-	waitConnections(t, servers[ownerIndex], node.id, 1)
+	waitConnections(t, servers[ownerIndex], node.id, 3)
 	data, _ := encodePacket(packet{Type: "data", Dest: node.id, Payload: "reconnected"})
 	if err := newConn.WriteMessage(websocket.TextMessage, data); err != nil {
 		t.Fatal(err)
 	}
+	for _, conn := range []*websocket.Conn{first, second} {
+		conn.SetReadDeadline(time.Now().Add(time.Second))
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("renewal at another server closed the owner's socket: %v", err)
+		}
+		got, err := decodePacket(raw)
+		if err != nil || got.Payload != "reconnected" {
+			t.Fatalf("existing socket delivery: %+v, %v", got, err)
+		}
+	}
+
 	newConn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	_, raw, err := newConn.ReadMessage()
 	if err != nil {

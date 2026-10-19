@@ -1,2 +1,5 @@
-*_test.go
-README.md
+*
+!Dockerfile
+!go.mod
+!go.sum
+!main.go

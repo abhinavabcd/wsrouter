@@ -23,6 +23,8 @@ Content-Type: application/json
 {"node_id":"auth.example.com|0123456789abcdef0123456789abcdef","secret":"opaque-secret"}
 ```
 
+An incoming `Origin` header is forwarded unchanged to the verifier; if absent, no `Origin` header is added. The authority decides whether that origin is permitted. This also applies to lookup and renewal, including renewal at a non-owner server. `/create` supports CORS from any domain but only constructs credentials; it does not call the verifier.
+
 The JSON body contains `node_id` and `secret`. The node ID is also retained in the query for compatibility. Existing `node_id` query values are replaced; other parameters are preserved. The router controls the `action` query parameter, adding `action=renew` for renewal and removing it for ordinary authentication.
 
 Approval requires HTTP 200 and JSON:
@@ -50,7 +52,7 @@ The local `/server` verifier approves only its own node ID and random secret, re
 
 An authenticated node is a server when its authority is the current server hostname, its permitted parent, or a descendant of that parent. For `sub1.x.y.com`, that parent is `x.y.com`. The public suffix list prevents widening trust to `com`, `co.uk`, or shared hosting suffixes such as `github.io`. Hostnames are compared on label boundaries. Ports do not change domain ownership. IP addresses and `localhost` use exact hostname matching.
 
-Renewal forwards to the ring owner, authenticate through the authority with `action=renew`, then disconnect the node's existing sockets. Rate limits and identity fields come from the authority response. Existing signed tokens require migration to the new node ID and token pair.
+Renewal authenticates directly through the authority with `action=renew` on whichever server receives the request, then disconnects that node's local sockets. It does not depend on ring ownership or proxy to another router; sockets on other servers remain connected. Rate limits and identity fields come from the authority response. Existing signed tokens require migration to the new node ID and token pair.
 
 ## Local HTTPS tests
 

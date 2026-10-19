@@ -18,7 +18,6 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -221,6 +220,7 @@ func main() {
 	}
 	go s.refreshLoop(context.Background(), time.Minute)
 	go s.receiptCleanupLoop(context.Background())
+	go s.watchCertificate(context.Background(), 30*time.Second)
 	log.Printf("listening on %s, ring id %d", listen, *id)
 	httpServer := &http.Server{Addr: listen, Handler: s.routes(), ReadHeaderTimeout: 5 * time.Second, TLSConfig: s.tlsConfig()}
 	log.Fatal(httpServer.ServeTLS(listener, "", ""))
@@ -281,7 +281,13 @@ func newServer(id uint64, addr, clusterAddr string) *server {
 }
 
 func (s *server) reloadCertificate() error {
-	entries, err := os.ReadDir(s.sslCerts)
+	// Resolve a published certificate directory once so a symlink switch cannot
+	// mix the old certificate with the new key.
+	directory, err := filepath.EvalSymlinks(s.sslCerts)
+	if err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(directory)
 	if err != nil {
 		return err
 	}
@@ -324,11 +330,32 @@ func (s *server) reloadCertificate() error {
 	if certFile == "" || keyFile == "" {
 		return errors.New("certificate pair not found")
 	}
-	cert, err := tls.LoadX509KeyPair(filepath.Join(s.sslCerts, certFile), filepath.Join(s.sslCerts, keyFile))
+	cert, err := tls.LoadX509KeyPair(filepath.Join(directory, certFile), filepath.Join(directory, keyFile))
 	if err == nil {
 		s.certificate.Store(&cert)
 	}
 	return err
+}
+
+func (s *server) watchCertificate(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			previous := s.certificate.Load()
+			if err := s.reloadCertificate(); err != nil {
+				log.Printf("certificate reload: %v", err)
+				continue
+			}
+			current := s.certificate.Load()
+			if previous == nil || !bytes.Equal(previous.Certificate[0], current.Certificate[0]) {
+				log.Print("TLS certificate reloaded")
+			}
+		}
+	}
 }
 
 func (s *server) tlsConfig() *tls.Config {
@@ -433,38 +460,7 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) error {
 
 func (s *server) renew(w http.ResponseWriter, r *http.Request) error {
 	nodeID, token := requestIdentity(r)
-	if _, _, err := authEndpoint(nodeID, token); err != nil {
-		return httpStatus(401)
-	}
-	owner, ok := s.owner(nodeID)
-	if !ok {
-		return httpStatus(http.StatusBadGateway)
-	}
-	if owner.Addr != s.addr {
-		hops := 0
-		var err error
-		if raw := r.Header.Get("X-Renew-Hops"); raw != "" {
-			hops, err = strconv.Atoi(raw)
-		}
-		if err != nil || hops < 0 || hops >= 4 {
-			return httpStatus(http.StatusLoopDetected)
-		}
-		target, err := url.Parse(owner.Addr)
-		if err != nil {
-			return httpStatus(http.StatusBadGateway)
-		}
-		proxy := httputil.NewSingleHostReverseProxy(target)
-		proxy.Transport = s.httpClient.Transport
-		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-			writeHTTPError(w, err)
-		}
-		r.Header.Set("X-Renew-Hops", strconv.Itoa(hops+1))
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		defer cancel()
-		proxy.ServeHTTP(w, r.WithContext(ctx))
-		return nil
-	}
-	c, err := s.authenticate(r.Context(), nodeID, token, "renew")
+	c, err := s.authenticate(r.Context(), nodeID, token, "renew", r.Header.Get("Origin"))
 	if err != nil {
 		return httpStatus(401)
 	}
@@ -499,7 +495,7 @@ func (s *server) disconnectNode(nodeID string) {
 
 func (s *server) locate(w http.ResponseWriter, r *http.Request) error {
 	nodeID, token := requestIdentity(r)
-	c, err := s.authenticate(r.Context(), nodeID, token, "")
+	c, err := s.authenticate(r.Context(), nodeID, token, "", r.Header.Get("Origin"))
 	if err != nil {
 		return httpStatus(401)
 	}
@@ -514,7 +510,7 @@ func (s *server) locate(w http.ResponseWriter, r *http.Request) error {
 
 func (s *server) connect(w http.ResponseWriter, r *http.Request) error {
 	nodeID, token := requestIdentity(r)
-	c, err := s.authenticate(r.Context(), nodeID, token, "")
+	c, err := s.authenticate(r.Context(), nodeID, token, "", r.Header.Get("Origin"))
 	if err != nil {
 		return httpStatus(401)
 	}
@@ -597,7 +593,7 @@ func (s *server) registerServer(w http.ResponseWriter, r *http.Request) error {
 	}
 	nodeID := domain + "|" + strconv.FormatUint(req.ID, 10)
 	token := "/server|" + req.Secret
-	if _, err := s.authenticate(r.Context(), nodeID, token, ""); err != nil {
+	if _, err := s.authenticate(r.Context(), nodeID, token, "", r.Header.Get("Origin")); err != nil {
 		return httpStatus(401)
 	}
 	return s.updateMember(w, r, peer{ID: req.ID, Addr: "https://" + domain, AuthToken: token, Nodes: req.Nodes})
@@ -664,7 +660,7 @@ func (s *server) receiveSnapshot(w http.ResponseWriter, r *http.Request) error {
 	if domain != strings.TrimPrefix(s.clusterAddr, "https://") || !strings.HasPrefix(token, "/server|") {
 		return httpStatus(401)
 	}
-	if _, err := s.authenticate(r.Context(), nodeID, token, ""); err != nil {
+	if _, err := s.authenticate(r.Context(), nodeID, token, "", r.Header.Get("Origin")); err != nil {
 		return httpStatus(401)
 	}
 	var state ringSnapshot
@@ -1279,7 +1275,7 @@ func (s *server) verifyServerNode(r *http.Request, id uint64) error {
 	if p.Addr == "" || nodeID != expected || subtle.ConstantTimeCompare([]byte(token), []byte(p.AuthToken)) != 1 {
 		return httpStatus(401)
 	}
-	c, err := s.authenticate(r.Context(), nodeID, token, "")
+	c, err := s.authenticate(r.Context(), nodeID, token, "", r.Header.Get("Origin"))
 	if err != nil || c.NodeType != "server" {
 		return httpStatus(401)
 	}
@@ -1385,7 +1381,7 @@ func requestIdentity(r *http.Request) (string, string) {
 	return nodeID, token
 }
 
-func (s *server) authenticate(ctx context.Context, nodeID, token, action string) (domainIdentity, error) {
+func (s *server) authenticate(ctx context.Context, nodeID, token, action, origin string) (domainIdentity, error) {
 	c := domainIdentity{NodeID: nodeID, Token: token, XSrcID: nodeID, NodeType: "node", RP5: 10}
 	u, secret, err := authEndpoint(nodeID, token)
 	if err != nil {
@@ -1406,6 +1402,9 @@ func (s *server) authenticate(ctx context.Context, nodeID, token, action string)
 		return c, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if origin != "" {
+		req.Header.Set("Origin", origin)
+	}
 	client := *s.httpClient
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := client.Do(req)

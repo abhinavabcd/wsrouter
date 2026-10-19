@@ -1,0 +1,91 @@
+"""HTTP-01 issuance and renewal, with atomic publication to the router."""
+import functools
+import hashlib
+import http.server
+import os
+from pathlib import Path
+import random
+import socket
+import ssl
+import subprocess
+import tempfile
+import threading
+import time
+
+DOMAIN = os.environ['DOMAIN']
+EXPECTED_IP = os.environ['EXPECTED_IP']
+ROOT = Path('/var/acme/webroot')
+LIVE = Path('/etc/letsencrypt/live') / DOMAIN
+TLS = Path('/tls')
+
+
+def publish():
+    cert = (LIVE / 'fullchain.pem').read_bytes()
+    key = (LIVE / 'privkey.pem').read_bytes()
+    ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(LIVE / 'fullchain.pem', LIVE / 'privkey.pem')
+    version = hashlib.sha256(cert + key).hexdigest()[:24]
+    directory = TLS / version
+    if not directory.exists():
+        pending = Path(tempfile.mkdtemp(prefix='.publish-', dir=TLS))
+        os.chmod(pending, 0o750)
+        (pending / 'server.pem').write_bytes(cert)
+        (pending / 'server.key').write_bytes(key)
+        os.chmod(pending / 'server.pem', 0o640)
+        os.chmod(pending / 'server.key', 0o640)
+        pending.rename(directory)
+    temporary = TLS / '.current-next'
+    temporary.unlink(missing_ok=True)
+    temporary.symlink_to(version)
+    temporary.replace(TLS / 'current')
+    print(f'Published certificate for {DOMAIN}', flush=True)
+
+
+class ChallengeHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/health':
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'ok')
+        elif self.path.startswith('/.well-known/acme-challenge/') and '..' not in self.path:
+            super().do_GET()
+        else:
+            self.send_error(404)
+
+    def list_directory(self, path):
+        self.send_error(404)
+        return None
+
+
+def main():
+    ROOT.mkdir(parents=True, exist_ok=True)
+    server = http.server.ThreadingHTTPServer(('0.0.0.0', 8080), functools.partial(ChallengeHandler, directory=str(ROOT)))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    common = ['certbot', '--non-interactive', '--config-dir', '/etc/letsencrypt', '--work-dir', '/var/acme/work', '--logs-dir', '/var/acme/logs']
+    issue = common + ['certonly', '--webroot', '--webroot-path', str(ROOT), '--cert-name', DOMAIN, '-d', DOMAIN, '--agree-tos', '--register-unsafely-without-email']
+    while not (LIVE / 'fullchain.pem').exists():
+        try:
+            addresses = set(socket.gethostbyname_ex(DOMAIN)[2])
+        except socket.gaierror:
+            addresses = set()
+        if addresses != {EXPECTED_IP}:
+            print(f'Waiting for DNS: {DOMAIN} A must be {EXPECTED_IP}; observed {sorted(addresses)}', flush=True)
+            time.sleep(30)
+            continue
+        print('Checking HTTP-01 with the staging CA before production issuance', flush=True)
+        if subprocess.run(issue + ['--dry-run'], timeout=300).returncode == 0:
+            if subprocess.run(issue, timeout=300).returncode == 0:
+                break
+        print('Issuance failed; retrying in 30 minutes', flush=True)
+        time.sleep(1800)
+    publish()
+    while True:
+        result = subprocess.run(common + ['renew', '--cert-name', DOMAIN, '--no-random-sleep-on-renew'], timeout=600)
+        if result.returncode == 0:
+            publish()
+        else:
+            print('Certificate renewal failed; existing certificate retained', flush=True)
+        time.sleep(12 * 3600 + random.randrange(1800))
+
+
+if __name__ == '__main__':
+    main()

@@ -88,7 +88,7 @@ func TestDomainAuthenticationLifecycle(t *testing.T) {
 	}
 	fixtureTokens.Store(result.Token, node.id)
 	connectNode(t, owner.Addr, result.Token, "")
-	c, err := servers[0].authenticate(context.Background(), node.id, result.Token, "")
+	c, err := servers[0].authenticate(context.Background(), node.id, result.Token, "", "")
 	if err != nil || c.RP5 != 23 {
 		t.Fatalf("rotated token: %+v %v", c, err)
 	}

@@ -71,7 +71,7 @@ func TestClusterRegistrationHTTPSProof(t *testing.T) {
 	for _, s := range []*server{leader, follower} {
 		for _, p := range s.ring {
 			nodeID := strings.TrimPrefix(p.Addr, "https://") + "|" + strconv.FormatUint(p.ID, 10)
-			c, err := s.authenticate(context.Background(), nodeID, p.AuthToken, "")
+			c, err := s.authenticate(context.Background(), nodeID, p.AuthToken, "", "")
 			if err != nil || c.NodeType != "server" || c.Expires != 0 {
 				t.Fatalf("server verification: %+v, %v", c, err)
 			}
