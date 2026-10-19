@@ -70,7 +70,8 @@ func TestHTTPSWSSAndCertificateReload(t *testing.T) {
 		t.Fatal(err)
 	}
 	baseURL := "https://" + listener.Addr().String()
-	s := newServer(0, baseURL, baseURL, []byte(strings.Repeat("s", 32)))
+	s := newServer(0, baseURL, baseURL)
+	s.httpClient.Transport = fixtureTransport.Clone()
 	s.sslCerts = certDir
 	if err := s.reloadCertificate(); err != nil {
 		t.Fatal(err)
@@ -108,7 +109,8 @@ func TestHTTPSWSSAndCertificateReload(t *testing.T) {
 	}
 	create := func(xSrc string) testNode {
 		t.Helper()
-		body, _ := json.Marshal(map[string]string{"x_src_id": xSrc})
+		secret := randomTestSecret()
+		body, _ := json.Marshal(map[string]string{"auth_domain": strings.TrimPrefix(fixtureAuthURL, "https://"), "path": "/verify", "secret_string": secret})
 		response, err := client.Post(baseURL+"/create", "application/json", bytes.NewReader(body))
 		if err != nil {
 			t.Fatal(err)
@@ -124,13 +126,14 @@ func TestHTTPSWSSAndCertificateReload(t *testing.T) {
 		if err := json.NewDecoder(response.Body).Decode(&node); err != nil {
 			t.Fatal(err)
 		}
+		fixtureAccounts.Store(secret, &fixtureAccount{nodeID: node.NodeID, source: xSrc, rate: 10})
 		return testNode{id: node.NodeID, token: node.Token}
 	}
 	source, dest := create("source"), create("dest")
 	dialer := websocket.Dialer{TLSClientConfig: &tls.Config{RootCAs: pool}}
 	connect := func(node testNode) *websocket.Conn {
 		t.Helper()
-		conn, _, err := dialer.Dial("wss://"+listener.Addr().String()+"/connect?token="+node.token, nil)
+		conn, _, err := dialer.Dial("wss://"+listener.Addr().String()+"/connect?"+nodeQuery(node.id, node.token), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -169,7 +172,8 @@ func TestHTTPSWSSAndCertificateReload(t *testing.T) {
 	reload := func(signature string) int {
 		t.Helper()
 		request, _ := http.NewRequest(http.MethodPost, baseURL+"/reload", nil)
-		request.Header.Set("X-Cluster-Signature", signature)
+		request.Header.Set("Authorization", "Bearer "+signature)
+		request.Header.Set("X-Node-ID", s.serverNodeID)
 		response, err := client.Do(request)
 		if err != nil {
 			t.Fatal(err)
@@ -180,7 +184,7 @@ func TestHTTPSWSSAndCertificateReload(t *testing.T) {
 	if got := reload("invalid"); got != http.StatusUnauthorized {
 		t.Fatalf("unauthorized reload returned %d", got)
 	}
-	signature := signBody([]byte("POST /reload"), s.serverSecret)
+	signature := s.serverToken
 	if err := os.WriteFile(certPath, []byte("invalid"), 0600); err != nil {
 		t.Fatal(err)
 	}

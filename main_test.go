@@ -30,59 +30,45 @@ type testNode struct {
 
 func startCluster(t *testing.T, count int) ([]*server, []*httptest.Server) {
 	t.Helper()
-	secret := []byte(strings.Repeat("s", 32))
 	servers := make([]*server, count)
-	httpServers := make([]*httptest.Server, count)
-	for i := 0; i < count; i++ {
-		id := (uint64(math.MaxInt64) / uint64(count)) * uint64(i)
-		clusterURL := "http://placeholder"
-		if i > 0 {
-			clusterURL = httpServers[0].URL
-		}
-		servers[i] = newServer(id, "http://placeholder", clusterURL, secret)
-		httpServers[i] = httptest.NewServer(servers[i].routes())
-		t.Cleanup(httpServers[i].Close)
-		servers[i].addr = httpServers[i].URL
-		if i == 0 {
-			servers[i].clusterAddr = httpServers[i].URL
-			servers[i].mu.Lock()
-			servers[i].members[id] = member{peer: peer{ID: id, Addr: httpServers[i].URL, AuthToken: servers[i].serverToken}, Seen: time.Now()}
-			servers[i].ring = []peer{{ID: id, Addr: httpServers[i].URL, AuthToken: servers[i].serverToken}}
-			servers[i].mu.Unlock()
-		} else if err := servers[i].refreshOnce(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-	}
+	urls := make([]*httptest.Server, count)
 	for i := range servers {
-		if err := servers[i].refreshOnce(context.Background()); err != nil {
-			t.Fatal(err)
+		cluster := ""
+		if i > 0 {
+			cluster = urls[0].URL
+		}
+		servers[i], urls[i] = startTestRouter(t, uint64(math.MaxInt64)/uint64(count)*uint64(i), cluster)
+		if i > 0 {
+			if err := servers[i].refreshOnce(context.Background()); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
-	return servers, httpServers
+	return servers, urls
 }
 
 func createNode(t *testing.T, baseURL, xSrc string, rp5 ...int64) testNode {
 	t.Helper()
-	req := map[string]any{"x_src_id": xSrc}
-	if len(rp5) != 0 {
-		req["rp5"] = rp5[0]
+	rate := int64(10)
+	if len(rp5) > 0 {
+		rate = rp5[0]
 	}
-	body, _ := json.Marshal(req)
+	secret := randomTestSecret()
+	body, _ := json.Marshal(map[string]any{"auth_domain": strings.TrimPrefix(fixtureAuthURL, "https://"), "path": "/verify", "secret_string": secret})
 	resp, err := http.Post(baseURL+"/create", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("create: %s", resp.Status)
-	}
 	var out struct {
 		NodeID string `json:"node_id"`
 		Token  string `json:"token"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		t.Fatal(err)
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || resp.StatusCode != 200 {
+		t.Fatalf("create: %s, %v", resp.Status, err)
 	}
+	fixtureAccounts.Store(secret, &fixtureAccount{nodeID: out.NodeID, source: xSrc, rate: rate})
+	fixtureTokens.Store(out.Token, out.NodeID)
 	return testNode{id: out.NodeID, token: out.Token}
 }
 
@@ -92,7 +78,7 @@ func connectNode(t *testing.T, baseURL, token string, origin string) *websocket.
 	if origin != "" {
 		headers.Set("Origin", origin)
 	}
-	conn, resp, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(baseURL, "http")+"/connect?token="+token, headers)
+	conn, resp, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(baseURL, "http")+"/connect?"+tokenQuery(token), headers)
 	if err != nil {
 		if resp != nil {
 			t.Fatalf("connect: %v (%s)", err, resp.Status)
@@ -146,18 +132,6 @@ func TestJSONAndToken(t *testing.T) {
 	if err != nil || !bytes.Contains(batch, []byte(`"dest_node_ids"`)) || bytes.Contains(batch, []byte(`"dest_ids"`)) {
 		t.Fatalf("wrong multi-destination field: %s, %v", batch, err)
 	}
-	s, _ := startCluster(t, 1)
-	token := s[0].signToken(claims{Issuer: s[0].id, NodeID: strings.Repeat("a", 32), XSrcID: "account", Expires: time.Now().Add(time.Hour).Unix()})
-	if _, err := s[0].verifyToken(token); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s[0].verifyToken(token + "x"); err == nil {
-		t.Fatal("tampered token accepted")
-	}
-	expired := s[0].signToken(claims{Issuer: s[0].id, NodeID: strings.Repeat("a", 32), XSrcID: "account", Expires: time.Now().Add(-time.Hour).Unix()})
-	if _, err := s[0].verifyToken(expired); err == nil {
-		t.Fatal("expired token accepted")
-	}
 }
 
 func TestMessageTimestampAcrossServers(t *testing.T) {
@@ -176,19 +150,14 @@ func TestMessageTimestampAcrossServers(t *testing.T) {
 	if destOwner.ID == sourceOwner.ID {
 		t.Fatal("could not place destination on another server")
 	}
-	c, err := servers[0].verifyToken(source.token)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c.NodeType = "server"
-	c.RP5 = 1 // Server connections bypass the rate limit as well as time checks.
-	serverToken := servers[0].signToken(c)
+	serverNode := serverTestNode(servers[0])
+	serverOwner, _ := servers[0].owner(serverNode.id)
 	nodeConn := connectNode(t, sourceOwner.Addr, source.token, "")
-	serverConn := connectNode(t, sourceOwner.Addr, serverToken, "")
+	serverConn := connectNode(t, serverOwner.Addr, serverNode.token, "")
 	destConn := connectNode(t, destOwner.Addr, dest.token, "")
 	for _, s := range servers {
 		if s.id == sourceOwner.ID {
-			waitConnections(t, s, source.id, 2)
+			waitConnections(t, s, source.id, 1)
 		} else {
 			waitConnections(t, s, dest.id, 1)
 		}
@@ -248,7 +217,7 @@ func TestMessageTimestampAcrossServers(t *testing.T) {
 				} else if *got.Timestamp < before || *got.Timestamp > time.Now().UnixMilli() {
 					t.Fatalf("timestamp %d is not the server's receive time", *got.Timestamp)
 				}
-				for _, feedbackConn := range []*websocket.Conn{nodeConn, serverConn} {
+				for _, feedbackConn := range []*websocket.Conn{nodeConn} {
 					feedbackConn.SetReadDeadline(time.Now().Add(3 * time.Second))
 					_, raw, err := feedbackConn.ReadMessage()
 					if err != nil {
@@ -267,9 +236,6 @@ func TestMessageTimestampAcrossServers(t *testing.T) {
 func TestTwoServerRoutingKeysAndCORS(t *testing.T) {
 	servers, httpServers := startCluster(t, 2)
 	leader, follower := servers[0], servers[1]
-	if !bytes.Equal(leader.serverSecret, follower.serverSecret) {
-		t.Fatal("servers must share the configured signing secret")
-	}
 	leaderURL, followerURL := httpServers[0].URL, httpServers[1].URL
 	source := createNode(t, followerURL, "source-account")
 	for owner, _ := leader.owner(source.id); owner.Addr != leaderURL; owner, _ = leader.owner(source.id) {
@@ -279,10 +245,10 @@ func TestTwoServerRoutingKeysAndCORS(t *testing.T) {
 	for owner, _ := leader.owner(dest.id); owner.Addr != followerURL; owner, _ = leader.owner(dest.id) {
 		dest = createNode(t, leaderURL, "dest-account")
 	}
-	if _, err := leader.verifyToken(source.token); err != nil {
+	if _, err := leader.authenticate(context.Background(), source.id, source.token, ""); err != nil {
 		t.Fatalf("leader rejected follower-issued token: %v", err)
 	}
-	if _, err := follower.verifyToken(dest.token); err != nil {
+	if _, err := follower.authenticate(context.Background(), dest.id, dest.token, ""); err != nil {
 		t.Fatalf("follower rejected leader-issued token: %v", err)
 	}
 	if leader.ring[1].AuthToken != follower.serverToken || follower.ring[0].AuthToken != leader.serverToken {
@@ -291,6 +257,7 @@ func TestTwoServerRoutingKeysAndCORS(t *testing.T) {
 	locateReq, _ := http.NewRequest(http.MethodGet, leaderURL+"/locate", nil)
 	locateReq.Header.Set("Origin", "https://other.example")
 	locateReq.Header.Set("Authorization", "Bearer "+dest.token)
+	locateReq.Header.Set("X-Node-ID", dest.id)
 	locateResp, err := http.DefaultClient.Do(locateReq)
 	if err != nil {
 		t.Fatal(err)
@@ -315,7 +282,7 @@ func TestTwoServerRoutingKeysAndCORS(t *testing.T) {
 		t.Fatalf("CORS preflight: %s, %s", resp.Status, resp.Header.Get("Access-Control-Allow-Origin"))
 	}
 
-	_, wrong, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(leaderURL, "http")+"/connect?token="+dest.token, nil)
+	_, wrong, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(leaderURL, "http")+"/connect?"+tokenQuery(dest.token), nil)
 	if err == nil || wrong == nil || wrong.StatusCode != http.StatusMisdirectedRequest {
 		t.Fatalf("expected 421 redirect, got %v, %v", wrong, err)
 	}
@@ -409,6 +376,7 @@ func TestRenewOnDifferentServer(t *testing.T) {
 	waitConnections(t, servers[ownerIndex], node.id, 2)
 	req, _ := http.NewRequest(http.MethodPost, urls[1-ownerIndex].URL+"/renew", strings.NewReader(`{"valid_for":321}`))
 	req.Header.Set("Authorization", "Bearer "+node.token)
+	req.Header.Set("X-Node-ID", node.id)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -424,9 +392,8 @@ func TestRenewOnDifferentServer(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&renewed); err != nil {
 		t.Fatal(err)
 	}
-	c, err := servers[0].verifyToken(renewed.Token)
-	if err != nil || c.NodeID != node.id || c.XSrcID != "account" || c.Issuer != owner.ID || c.Nonce == "" || renewed.Token == node.token || c.Expires < time.Now().Unix()+319 || c.Expires > time.Now().Unix()+321 {
-		t.Fatalf("wrong renewed claims: %+v, %v", c, err)
+	if renewed.NodeID != node.id || renewed.Token != node.token {
+		t.Fatal("unexpected renewal identity")
 	}
 	for _, conn := range []*websocket.Conn{first, second} {
 		conn.SetReadDeadline(time.Now().Add(time.Second))
@@ -455,8 +422,7 @@ func TestRenewOnDifferentServer(t *testing.T) {
 }
 
 func TestRingChangeRequestsReconnect(t *testing.T) {
-	servers, urls := startCluster(t, 1)
-	leader := servers[0]
+	_, urls := startCluster(t, 1)
 	var node testNode
 	for i := 0; i < 1000; i++ {
 		node = createNode(t, urls[0].URL, "account")
@@ -468,10 +434,7 @@ func TestRingChangeRequestsReconnect(t *testing.T) {
 		t.Fatal("could not find follower-owned node")
 	}
 	conn := connectNode(t, urls[0].URL, node.token, "")
-	follower := newServer(1<<62, "http://placeholder", urls[0].URL, leader.serverSecret)
-	ts := httptest.NewServer(follower.routes())
-	t.Cleanup(ts.Close)
-	follower.addr = ts.URL
+	follower, ts := startTestRouter(t, 1<<62, urls[0].URL)
 	if err := follower.refreshOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -675,11 +638,8 @@ func TestStressFiveServers(t *testing.T) {
 
 func TestJoinBroadcastsTokenBeforeForwarding(t *testing.T) {
 	servers, urls := startCluster(t, 2)
-	leader, existing := servers[0], servers[1]
-	joining := newServer(2*uint64(math.MaxInt64/3), "http://placeholder", urls[0].URL, leader.serverSecret)
-	ts := httptest.NewServer(joining.routes())
-	t.Cleanup(ts.Close)
-	joining.addr = ts.URL
+	existing := servers[1]
+	joining, ts := startTestRouter(t, 2*uint64(math.MaxInt64/3), urls[0].URL)
 	if err := joining.refreshOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -951,88 +911,10 @@ func TestUnresponsiveWebSocketClosesWithinTenSeconds(t *testing.T) {
 	}
 }
 
-func TestCreateTokenLifetimeAndServerRouting(t *testing.T) {
+func TestDomainServerRouting(t *testing.T) {
 	servers, urls := startCluster(t, 2)
-	removed, err := http.Post(urls[0].URL+"/generate", "application/json", strings.NewReader(`{"x_src_id":"old"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	removed.Body.Close()
-	if removed.StatusCode != http.StatusNotFound {
-		t.Fatalf("removed generate route returned %s", removed.Status)
-	}
-	postCreate := func(body []byte, signature string) (*http.Response, error) {
-		req, err := http.NewRequest(http.MethodPost, urls[0].URL+"/create", bytes.NewReader(body))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		if signature != "" {
-			req.Header.Set("X-Cluster-Signature", signature)
-		}
-		return http.DefaultClient.Do(req)
-	}
-	create := func(body []byte, signature string) (testNode, claims) {
-		t.Helper()
-		resp, err := postCreate(body, signature)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("create returned %s", resp.Status)
-		}
-		var result struct {
-			NodeID   string `json:"node_id"`
-			NodeType string `json:"node_type"`
-			Token    string `json:"token"`
-			Expires  int64  `json:"expires"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			t.Fatal(err)
-		}
-		c, err := servers[0].verifyToken(result.Token)
-		if err != nil || result.NodeID != c.NodeID || result.NodeType != c.NodeType || result.Expires != c.Expires {
-			t.Fatalf("create claims: %+v, %+v, %v", result, c, err)
-		}
-		return testNode{id: result.NodeID, token: result.Token}, c
-	}
-	defaultNode, defaultClaims := create([]byte(`{"x_src_id":"default"}`), "")
-	if defaultClaims.NodeType != "node" || defaultClaims.Expires-time.Now().Unix() < 90*86400-2 || defaultClaims.Expires-time.Now().Unix() > 90*86400 {
-		t.Fatalf("wrong default claims: %+v", defaultClaims)
-	}
-	_, customClaims := create([]byte(`{"x_src_id":"short","valid_for":123}`), "")
-	if customClaims.Expires-time.Now().Unix() < 121 || customClaims.Expires-time.Now().Unix() > 123 {
-		t.Fatalf("wrong custom expiry: %+v", customClaims)
-	}
-	for _, body := range [][]byte{
-		[]byte(`{"x_src_id":"bad","valid_for":0}`),
-		[]byte(`{"x_src_id":"bad","valid_for":-1}`),
-		[]byte(`{"x_src_id":"bad","valid_for":9223372036854775807}`),
-		[]byte(`{"x_src_id":"bad","node_type":"unknown"}`),
-	} {
-		resp, err := postCreate(body, "")
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusBadRequest {
-			t.Fatalf("invalid create returned %s", resp.Status)
-		}
-	}
-	serverBody := []byte(`{"x_src_id":"router","node_type":"server","valid_for":3600}`)
-	resp, err := postCreate(serverBody, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("unsigned server token returned %s", resp.Status)
-	}
-	serverNode, serverClaims := create(serverBody, signBody(serverBody, servers[0].serverSecret))
-	if serverClaims.NodeType != "server" {
-		t.Fatalf("wrong server claims: %+v", serverClaims)
-	}
+	defaultNode := createNode(t, urls[0].URL, "default")
+	serverNode := serverTestNode(servers[0])
 	dest := createNode(t, urls[1].URL, "dest")
 	ownerURL := func(nodeID string) string {
 		t.Helper()
@@ -1086,44 +968,6 @@ func TestCreateTokenLifetimeAndServerRouting(t *testing.T) {
 	got, err := decodePacket(manualData)
 	if err != nil || got.PacketID != "manual-status" || got.Type != "status" || got.Src != defaultNode.id || got.SrcNodeID != "preserved-node" || got.XSrc != "delegated-account" || got.Payload != "custom" {
 		t.Fatalf("server status was changed: %+v, %v", got, err)
-	}
-}
-
-func TestRenewTokenLifetime(t *testing.T) {
-	servers, urls := startCluster(t, 2)
-	node := createNode(t, urls[0].URL, "account")
-	for _, tc := range []struct {
-		body string
-		want int64
-	}{
-		{`{"valid_for":456}`, 456},
-		{"", 90 * 86400},
-	} {
-		req, err := http.NewRequest(http.MethodPost, urls[1].URL+"/renew", strings.NewReader(tc.body))
-		if err != nil {
-			t.Fatal(err)
-		}
-		req.Header.Set("Authorization", "Bearer "+node.token)
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			t.Fatalf("renew returned %s", resp.Status)
-		}
-		var result struct {
-			Token string `json:"token"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			resp.Body.Close()
-			t.Fatal(err)
-		}
-		resp.Body.Close()
-		c, err := servers[0].verifyToken(result.Token)
-		if err != nil || c.NodeID != node.id || c.NodeType != "node" || c.Expires-time.Now().Unix() < tc.want-2 || c.Expires-time.Now().Unix() > tc.want {
-			t.Fatalf("renewed claims: %+v, %v", c, err)
-		}
 	}
 }
 
@@ -1403,7 +1247,7 @@ func TestPeerWebSocketReusesLinkAndReplaysOnClose(t *testing.T) {
 func TestSocketKeepAliveOverride(t *testing.T) {
 	servers, urls := startCluster(t, 1)
 	node := createNode(t, urls[0].URL, "keepalive")
-	address := "ws" + strings.TrimPrefix(urls[0].URL, "http") + "/connect?token=" + node.token
+	address := "ws" + strings.TrimPrefix(urls[0].URL, "http") + "/connect?" + tokenQuery(node.token)
 	conn, _, err := websocket.DefaultDialer.Dial(address+"&tcp_keep_alive=1", nil)
 	if err != nil {
 		t.Fatal(err)

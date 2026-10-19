@@ -3,11 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -17,6 +16,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/net/publicsuffix"
 )
 
 type peer struct {
@@ -48,17 +49,6 @@ type ringSnapshot struct {
 type member struct {
 	peer
 	Seen time.Time
-}
-
-type claims struct {
-	Issuer        uint64 `json:"issuer"`
-	NodeID        string `json:"node_id"`
-	XSrcID        string `json:"x_src_id"`
-	NodeType      string `json:"node_type,omitempty"`
-	AuthVerifyURL string `json:"auth_verify_url,omitempty"`
-	Nonce         string `json:"nonce,omitempty"`
-	Expires       int64  `json:"expires"`
-	RP5           int64  `json:"rp5"`
 }
 
 type packet struct {
@@ -134,18 +124,17 @@ type client struct {
 }
 
 type server struct {
-	id            uint64
-	addr          string
-	clusterAddr   string
-	serverSecret  []byte
-	clusterSecret []byte
-	serverToken   string // guarded by mu; issued by the primary after joining
-	leader        bool
-	httpClient    *http.Client
-	upgrader      websocket.Upgrader
-	sslCerts      string
-	keepAlive     time.Duration
-	certificate   atomic.Pointer[tls.Certificate]
+	id           uint64
+	addr         string
+	clusterAddr  string
+	serverToken  string // local credential, regenerated on restart
+	serverNodeID string
+	leader       bool
+	httpClient   *http.Client
+	upgrader     websocket.Upgrader
+	sslCerts     string
+	keepAlive    time.Duration
+	certificate  atomic.Pointer[tls.Certificate]
 
 	refreshMu     sync.Mutex
 	peerDialMu    sync.Mutex
@@ -194,17 +183,12 @@ type peerLink struct {
 
 func main() {
 	sslCerts := flag.String("ssl_certs", "", "directory containing a TLS certificate and private key")
-	addr := flag.String("addr", "", "public HTTP base URL of this server")
+	addr := flag.String("addr", "", "public HTTPS base URL of this server")
 	clusterAddr := flag.String("clusteraddr", "", "primary server URL; omitted starts a leader")
-	clusterSecret := flag.String("cluster_secret", "", "cluster join credential (or CLUSTER_SECRET)")
 	id := flag.Uint64("id", 0, "unique position on the 64-bit hash ring")
 	flag.Parse()
-	secret := os.Getenv("SERVER_SECRET")
-	if secret == "" {
-		secret = os.Getenv("server_secret")
-	}
-	if *addr == "" || len(secret) < 32 {
-		log.Fatal("--addr and SERVER_SECRET (at least 32 bytes) are required")
+	if *addr == "" || *sslCerts == "" {
+		log.Fatal("--addr (HTTPS) and --ssl_certs are required")
 	}
 	if *id > math.MaxInt64 {
 		log.Fatal("--id must be between 0 and MaxInt64")
@@ -218,19 +202,7 @@ func main() {
 			log.Fatal(err)
 		}
 	}
-	s := newServer(*id, strings.TrimRight(*addr, "/"), strings.TrimRight(*clusterAddr, "/"), []byte(secret))
-	if *clusterSecret == "" {
-		*clusterSecret = os.Getenv("CLUSTER_SECRET")
-	}
-	if *clusterSecret == "" {
-		*clusterSecret = os.Getenv("cluster_secret")
-	}
-	if *clusterSecret != "" {
-		if len(*clusterSecret) < 32 {
-			log.Fatal("cluster_secret must contain at least 32 bytes")
-		}
-		s.clusterSecret = []byte(*clusterSecret)
-	}
+	s := newServer(*id, strings.TrimRight(*addr, "/"), strings.TrimRight(*clusterAddr, "/"))
 	if value := os.Getenv("TCP_KEEP_ALIVE"); value != "" {
 		interval, err := time.ParseDuration(value + "s")
 		if err != nil || interval <= 0 || interval > time.Duration(math.MaxInt64)-10*time.Second {
@@ -238,40 +210,33 @@ func main() {
 		}
 		s.keepAlive = interval
 	}
-	if *sslCerts != "" {
-		if !strings.HasPrefix(s.addr, "https://") {
-			log.Fatal("--addr must use https when --ssl_certs is set")
-		}
-		s.sslCerts = *sslCerts
-		if err := s.reloadCertificate(); err != nil {
-			log.Fatal(err)
-		}
+	s.sslCerts = *sslCerts
+	if err := s.reloadCertificate(); err != nil {
+		log.Fatal(err)
 	}
-	if strings.HasPrefix(s.addr, "https://") && s.sslCerts == "" {
-		log.Fatal("https --addr requires --ssl_certs")
+	// Bind before joining: the primary calls back to verify this server.
+	listener, err := net.Listen("tcp", listen)
+	if err != nil {
+		log.Fatal(err)
 	}
 	go s.refreshLoop(context.Background(), time.Minute)
 	go s.receiptCleanupLoop(context.Background())
 	log.Printf("listening on %s, ring id %d", listen, *id)
-	httpServer := &http.Server{Addr: listen, Handler: s.routes(), ReadHeaderTimeout: 5 * time.Second}
-	if s.sslCerts != "" {
-		httpServer.TLSConfig = s.tlsConfig()
-		log.Fatal(httpServer.ListenAndServeTLS("", ""))
-	}
-	log.Fatal(httpServer.ListenAndServe())
+	httpServer := &http.Server{Addr: listen, Handler: s.routes(), ReadHeaderTimeout: 5 * time.Second, TLSConfig: s.tlsConfig()}
+	log.Fatal(httpServer.ServeTLS(listener, "", ""))
 }
 
 func listenAddress(raw string) (string, error) {
 	u, err := url.Parse(raw)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
 		return "", errors.New("invalid server address")
+	}
+	if _, err := authAuthority(u.Host); err != nil {
+		return "", err
 	}
 	port := u.Port()
 	if port == "" {
-		port = "80"
-		if u.Scheme == "https" {
-			port = "443"
-		}
+		port = "443"
 	}
 	number, err := strconv.Atoi(port)
 	if err != nil || number < 1 || number > 65535 {
@@ -280,14 +245,16 @@ func listenAddress(raw string) (string, error) {
 	return ":" + port, nil
 }
 
-func newServer(id uint64, addr, clusterAddr string, secret []byte) *server {
+func newServer(id uint64, addr, clusterAddr string) *server {
+	addr = strings.ToLower(strings.TrimRight(addr, "/"))
+	clusterAddr = strings.ToLower(strings.TrimRight(clusterAddr, "/"))
 	if clusterAddr == "" {
 		clusterAddr = addr
 	}
 	s := &server{
-		id: id, addr: addr, clusterAddr: clusterAddr, serverSecret: secret, clusterSecret: secret,
+		id: id, addr: addr, clusterAddr: clusterAddr,
 		leader:       addr == clusterAddr,
-		httpClient:   &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{MaxIdleConns: 1024, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second}},
+		httpClient:   &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }, Transport: &http.Transport{MaxIdleConns: 1024, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second}},
 		upgrader:     websocket.Upgrader{ReadBufferSize: 4096, WriteBufferSize: 4096, CheckOrigin: func(*http.Request) bool { return true }},
 		keepAlive:    30 * time.Second,
 		members:      make(map[uint64]member),
@@ -296,8 +263,13 @@ func newServer(id uint64, addr, clusterAddr string, secret []byte) *server {
 		nodes:        make(map[string]*nodeState),
 		packetPrefix: fmt.Sprintf("%x-%x-", id, time.Now().UnixNano()),
 	}
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		panic(err)
+	}
+	s.serverToken = "/server|" + hex.EncodeToString(secret)
+	s.serverNodeID = strings.TrimPrefix(addr, "https://") + "|" + strconv.FormatUint(id, 10)
 	if s.leader {
-		s.serverToken = s.serverNodeToken(id)
 		s.members[id] = member{peer: peer{ID: id, Addr: addr, AuthToken: s.serverToken}, Seen: time.Now()}
 		s.ring = []peer{{ID: id, Addr: addr, AuthToken: s.serverToken}}
 		s.epoch = time.Now().UnixNano()
@@ -376,7 +348,7 @@ func (s *server) reload(w http.ResponseWriter, r *http.Request) error {
 	if s.sslCerts == "" {
 		return httpStatus(http.StatusNotFound)
 	}
-	if !verifyBody([]byte("POST /reload"), r.Header.Get("X-Cluster-Signature"), s.serverSecret) {
+	if r.Header.Get("X-Node-ID") != s.serverNodeID || subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")), []byte(s.serverToken)) != 1 {
 		return httpStatus(http.StatusUnauthorized)
 	}
 	if err := s.reloadCertificate(); err != nil {
@@ -396,6 +368,7 @@ func (s *server) routes() http.Handler {
 		})
 	}
 	handle("POST /create", s.create)
+	handle("POST /server", s.registerServer)
 	handle("POST /renew", s.renew)
 	handle("GET /connect", s.connect)
 	handle("GET /locate", s.locate)
@@ -406,7 +379,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /health", s.health)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Node-ID")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -428,76 +401,48 @@ func writeHTTPError(w http.ResponseWriter, err error) {
 	http.Error(w, http.StatusText(code), code)
 }
 
-func tokenExpiry(validFor *int64) (int64, error) {
-	seconds := int64(90 * 86400)
-	if validFor != nil {
-		seconds = *validFor
-	}
-	now := time.Now().Unix()
-	if seconds <= 0 || seconds > math.MaxInt64-now {
-		return 0, errors.New("valid_for must be a positive number of seconds")
-	}
-	return now + seconds, nil
-}
-
 func (s *server) create(w http.ResponseWriter, r *http.Request) error {
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4096))
 	var req struct {
-		XSrcID        string `json:"x_src_id"`
-		NodeType      string `json:"node_type"`
-		ValidFor      *int64 `json:"valid_for"`
-		AuthVerifyURL string `json:"auth_verify_url"`
-		RP5           int64  `json:"rp5"`
+		AuthDomain string `json:"auth_domain"`
+		Path       string `json:"path"`
+		Secret     string `json:"secret_string"`
 	}
-	req.RP5 = 10
-	if err != nil || json.Unmarshal(body, &req) != nil || len(req.XSrcID) == 0 || len(req.XSrcID) > 256 || req.RP5 <= 0 || (req.NodeType != "" && req.NodeType != "node" && req.NodeType != "server") {
-		return httpStatus(http.StatusBadRequest)
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 12288)).Decode(&req) != nil {
+		return httpStatus(400)
 	}
-	if req.NodeType == "server" && !verifyBody(body, r.Header.Get("X-Cluster-Signature"), s.serverSecret) {
-		return httpStatus(http.StatusUnauthorized)
-	}
-	if req.AuthVerifyURL != "" {
-		if _, err := parseVerifyURL(req.AuthVerifyURL); err != nil {
-			return httpStatus(http.StatusBadRequest)
-		}
-	}
-	expires, err := tokenExpiry(req.ValidFor)
+	domain, err := authAuthority(req.AuthDomain)
 	if err != nil {
-		return httpStatus(http.StatusBadRequest)
+		return httpStatus(400)
+	}
+	token := req.Path + "|" + req.Secret
+	if _, _, err := authEndpoint(domain+"|new", token); err != nil {
+		return httpStatus(400)
 	}
 	id := make([]byte, 16)
 	if _, err := rand.Read(id); err != nil {
 		return err
 	}
-	if req.NodeType == "" {
-		req.NodeType = "node"
-	}
-	c := claims{Issuer: s.id, NodeID: hex.EncodeToString(id), XSrcID: req.XSrcID, NodeType: req.NodeType, Expires: expires, AuthVerifyURL: req.AuthVerifyURL, RP5: req.RP5}
-	token := s.signToken(c)
-	w.Header().Set("Content-Type", "application/json")
-	result := map[string]any{"node_id": c.NodeID, "node_type": c.NodeType, "token": token, "expires": c.Expires, "rp5": c.RP5}
-	if owner, ok := s.owner(c.NodeID); ok {
+	nodeID := domain + "|" + hex.EncodeToString(id)
+	result := map[string]any{"node_id": nodeID, "token": token}
+	if owner, ok := s.owner(nodeID); ok {
 		result["address"] = owner.Addr
 	}
-	json.NewEncoder(w).Encode(result)
-	return nil
+	w.Header().Set("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(result)
 }
 
 func (s *server) renew(w http.ResponseWriter, r *http.Request) error {
-	authorization := r.Header.Get("Authorization")
-	if !strings.HasPrefix(authorization, "Bearer ") {
-		return httpStatus(http.StatusUnauthorized)
+	nodeID, token := requestIdentity(r)
+	if _, _, err := authEndpoint(nodeID, token); err != nil {
+		return httpStatus(401)
 	}
-	c, err := s.verifyTokenSignature(strings.TrimPrefix(authorization, "Bearer "))
-	if err != nil || (c.Expires != 0 && c.Expires <= time.Now().Unix() && c.AuthVerifyURL == "") {
-		return httpStatus(http.StatusUnauthorized)
-	}
-	owner, ok := s.owner(c.NodeID)
+	owner, ok := s.owner(nodeID)
 	if !ok {
 		return httpStatus(http.StatusBadGateway)
 	}
 	if owner.Addr != s.addr {
 		hops := 0
+		var err error
 		if raw := r.Header.Get("X-Renew-Hops"); raw != "" {
 			hops, err = strconv.Atoi(raw)
 		}
@@ -519,34 +464,13 @@ func (s *server) renew(w http.ResponseWriter, r *http.Request) error {
 		proxy.ServeHTTP(w, r.WithContext(ctx))
 		return nil
 	}
-	var req struct {
-		ValidFor *int64 `json:"valid_for"`
-	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&req); err != nil && err != io.EOF {
-		return httpStatus(http.StatusBadRequest)
-	}
-	expires, err := tokenExpiry(req.ValidFor)
+	c, err := s.authenticate(r.Context(), nodeID, token, "renew")
 	if err != nil {
-		return httpStatus(http.StatusBadRequest)
+		return httpStatus(401)
 	}
-	if err := s.verifyAuthorization(r.Context(), c.AuthVerifyURL, "renew"); err != nil {
-		return httpStatus(http.StatusUnauthorized)
-	}
-	if c.Expires == 0 {
-		expires = 0
-	}
-	nonce := make([]byte, 16)
-	if _, err := rand.Read(nonce); err != nil {
-		return err
-	}
-	c.Nonce = hex.EncodeToString(nonce)
-	c.Issuer = s.id
-	c.Expires = expires
-	token := s.signToken(c)
-	s.disconnectNode(c.NodeID)
+	s.disconnectNode(nodeID)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"node_id": c.NodeID, "node_type": c.NodeType, "token": token, "expires": c.Expires, "rp5": c.RP5})
-	return nil
+	return json.NewEncoder(w).Encode(c)
 }
 
 func (s *server) disconnectNode(nodeID string) {
@@ -574,16 +498,10 @@ func (s *server) disconnectNode(nodeID string) {
 }
 
 func (s *server) locate(w http.ResponseWriter, r *http.Request) error {
-	token := r.URL.Query().Get("token")
-	if token == "" && strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
-		token = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	}
-	c, err := s.verifyToken(token)
+	nodeID, token := requestIdentity(r)
+	c, err := s.authenticate(r.Context(), nodeID, token, "")
 	if err != nil {
-		return httpStatus(http.StatusUnauthorized)
-	}
-	if err := s.verifyAuthorization(r.Context(), c.AuthVerifyURL, ""); err != nil {
-		return httpStatus(http.StatusUnauthorized)
+		return httpStatus(401)
 	}
 	owner, ok := s.owner(c.NodeID)
 	if !ok {
@@ -595,13 +513,10 @@ func (s *server) locate(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (s *server) connect(w http.ResponseWriter, r *http.Request) error {
-	token := r.URL.Query().Get("token")
-	if token == "" && strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
-		token = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	}
-	c, err := s.verifyToken(token)
+	nodeID, token := requestIdentity(r)
+	c, err := s.authenticate(r.Context(), nodeID, token, "")
 	if err != nil {
-		return httpStatus(http.StatusUnauthorized)
+		return httpStatus(401)
 	}
 	owner, ok := s.owner(c.NodeID)
 	if !ok {
@@ -612,9 +527,6 @@ func (s *server) connect(w http.ResponseWriter, r *http.Request) error {
 		w.WriteHeader(http.StatusMisdirectedRequest)
 		json.NewEncoder(w).Encode(map[string]string{"address": owner.Addr})
 		return nil
-	}
-	if err := s.verifyAuthorization(r.Context(), c.AuthVerifyURL, ""); err != nil {
-		return httpStatus(http.StatusUnauthorized)
 	}
 	keepAlive := s.keepAlive
 	if c.NodeType == "server" {
@@ -652,35 +564,80 @@ func (s *server) connect(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
+// /server verifies this process's credential or registers a joining server.
+func (s *server) registerServer(w http.ResponseWriter, r *http.Request) error {
+	var req struct {
+		NodeID string `json:"node_id"`
+		Domain string `json:"server_domain"`
+		ID     uint64 `json:"id"`
+		Secret string `json:"secret"`
+		Nodes  int64  `json:"nodes"`
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 12288))
+	if err != nil || json.Unmarshal(body, &req) != nil {
+		return httpStatus(400)
+	}
+	if req.NodeID != "" || r.URL.Query().Has("node_id") {
+		_, secret, _ := strings.Cut(s.serverToken, "|")
+		if req.NodeID != s.serverNodeID || (r.URL.Query().Has("node_id") && r.URL.Query().Get("node_id") != req.NodeID) || subtle.ConstantTimeCompare([]byte(req.Secret), []byte(secret)) != 1 {
+			return httpStatus(401)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		return json.NewEncoder(w).Encode(map[string]any{"valid": true, "rp5": 10})
+	}
+	if !s.leader {
+		return httpStatus(404)
+	}
+	if req.ID > math.MaxInt64 || req.Nodes < 0 {
+		return httpStatus(400)
+	}
+	domain, err := authAuthority(req.Domain)
+	if err != nil || !sameServerDomain(domain, strings.TrimPrefix(s.addr, "https://")) {
+		return httpStatus(403)
+	}
+	nodeID := domain + "|" + strconv.FormatUint(req.ID, 10)
+	token := "/server|" + req.Secret
+	if _, err := s.authenticate(r.Context(), nodeID, token, ""); err != nil {
+		return httpStatus(401)
+	}
+	return s.updateMember(w, r, peer{ID: req.ID, Addr: "https://" + domain, AuthToken: token, Nodes: req.Nodes})
+}
+
 func (s *server) refresh(w http.ResponseWriter, r *http.Request) error {
 	if !s.leader {
-		return httpStatus(http.StatusNotFound)
+		return httpStatus(404)
 	}
-	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4096))
-	if err != nil || !verifyBody(data, r.Header.Get("X-Server-Signature"), s.serverSecret) {
-		return httpStatus(http.StatusUnauthorized)
+	var p peer
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&p) != nil || p.Nodes < 0 {
+		return httpStatus(400)
 	}
+	if err := s.verifyServerNode(r, p.ID); err != nil {
+		return err
+	}
+	s.mu.RLock()
+	existing, ok := s.members[p.ID]
+	s.mu.RUnlock()
+	if !ok || existing.Addr != p.Addr {
+		return httpStatus(409)
+	}
+	p.AuthToken = existing.AuthToken
+	return s.updateMember(w, r, p)
+}
+
+func (s *server) updateMember(w http.ResponseWriter, r *http.Request, p peer) error {
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
-	var p peer
-	if json.Unmarshal(data, &p) != nil || p.ID > math.MaxInt64 || p.Addr == "" || p.Nodes < 0 {
-		return httpStatus(http.StatusBadRequest)
+	s.mu.Lock()
+	if p.ID == s.id || (s.members[p.ID].Addr != "" && s.members[p.ID].Addr != p.Addr) {
+		s.mu.Unlock()
+		return httpStatus(409)
 	}
-	if !verifyBody(data, r.Header.Get("X-Cluster-Signature"), s.clusterSecret) {
-		if err := s.verifyServerNode(r, p.ID); err != nil {
-			return err
+	for id, m := range s.members {
+		if id != p.ID && m.Addr == p.Addr {
+			s.mu.Unlock()
+			return httpStatus(409)
 		}
 	}
-	u, err := url.Parse(p.Addr)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Path != "" || u.RawQuery != "" {
-		return httpStatus(http.StatusBadRequest)
-	}
-	s.mu.Lock()
-	if existing, ok := s.members[p.ID]; ok && existing.Addr != p.Addr {
-		s.mu.Unlock()
-		return httpStatus(http.StatusConflict)
-	}
-	p.AuthToken = s.serverNodeToken(p.ID)
 	s.members[p.ID] = member{peer: p, Seen: time.Now()}
 	snapshot := s.snapshotLocked()
 	s.version++
@@ -690,11 +647,8 @@ func (s *server) refresh(w http.ResponseWriter, r *http.Request) error {
 	if s.applySnapshot(snapshot, s.epoch, version) {
 		s.broadcastSnapshot(r.Context(), state)
 	}
-	data, _ = json.Marshal(state)
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Cluster-Signature", signBody(data, s.serverSecret))
-	w.Write(data)
-	return nil
+	return json.NewEncoder(w).Encode(state)
 }
 
 func (s *server) receiveSnapshot(w http.ResponseWriter, r *http.Request) error {
@@ -702,8 +656,16 @@ func (s *server) receiveSnapshot(w http.ResponseWriter, r *http.Request) error {
 		return httpStatus(http.StatusNotFound)
 	}
 	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
-	if err != nil || !verifyBody(data, r.Header.Get("X-Cluster-Signature"), s.serverSecret) {
-		return httpStatus(http.StatusUnauthorized)
+	if err != nil {
+		return httpStatus(400)
+	}
+	nodeID, token := requestIdentity(r)
+	domain, _, _ := strings.Cut(nodeID, "|")
+	if domain != strings.TrimPrefix(s.clusterAddr, "https://") || !strings.HasPrefix(token, "/server|") {
+		return httpStatus(401)
+	}
+	if _, err := s.authenticate(r.Context(), nodeID, token, ""); err != nil {
+		return httpStatus(401)
 	}
 	var state ringSnapshot
 	if json.Unmarshal(data, &state) != nil || state.Epoch <= 0 || state.Version == 0 || len(state.Peers) == 0 {
@@ -718,7 +680,6 @@ func (s *server) broadcastSnapshot(ctx context.Context, state ringSnapshot) {
 	data, _ := json.Marshal(state)
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	signature := signBody(data, s.serverSecret)
 	var wg sync.WaitGroup
 	for _, member := range state.Peers {
 		if member.ID == s.id {
@@ -731,7 +692,8 @@ func (s *server) broadcastSnapshot(ctx context.Context, state ringSnapshot) {
 			if err != nil {
 				return
 			}
-			req.Header.Set("X-Cluster-Signature", signature)
+			req.Header.Set("X-Node-ID", s.serverNodeID)
+			req.Header.Set("Authorization", "Bearer "+s.serverToken)
 			resp, err := s.httpClient.Do(req)
 			if err != nil {
 				return
@@ -781,19 +743,13 @@ func (s *server) refreshOnce(ctx context.Context) error {
 		}
 		return nil
 	}
-	s.mu.RLock()
-	token := s.serverToken
-	s.mu.RUnlock()
-	data, _ := json.Marshal(peer{ID: s.id, Addr: s.addr, Nodes: s.nodeCount.Load(), AuthToken: token})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.clusterAddr+"/refresh", bytes.NewReader(data))
+	_, secret, _ := strings.Cut(s.serverToken, "|")
+	data, _ := json.Marshal(map[string]any{"server_domain": strings.TrimPrefix(s.addr, "https://"), "id": s.id, "secret": secret, "nodes": s.nodeCount.Load()})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.clusterAddr+"/server", bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
-	req.Header.Set("X-Cluster-Signature", signBody(data, s.clusterSecret))
-	req.Header.Set("X-Server-Signature", signBody(data, s.serverSecret))
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return err
@@ -803,7 +759,7 @@ func (s *server) refreshOnce(ctx context.Context) error {
 		return fmt.Errorf("leader returned %s", resp.Status)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil || !verifyBody(body, resp.Header.Get("X-Cluster-Signature"), s.serverSecret) {
+	if err != nil {
 		return errors.New("invalid cluster snapshot")
 	}
 	var state ringSnapshot
@@ -850,12 +806,6 @@ func (s *server) applySnapshot(snapshot []peer, epoch int64, version uint64) boo
 		}
 	}
 	s.ring = snapshot
-	for _, p := range snapshot {
-		if p.ID == s.id {
-			s.serverToken = p.AuthToken
-			break
-		}
-	}
 	var moved []struct {
 		cl   *client
 		addr string
@@ -1316,126 +1266,185 @@ func (s *server) peerToken(id uint64) (string, bool) {
 	return s.ring[i].AuthToken, true
 }
 
-func (s *server) signToken(c claims) string {
-	data, _ := json.Marshal(c)
-	payload := base64.RawURLEncoding.EncodeToString(data)
-	mac := hmac.New(sha256.New, s.serverSecret)
-	mac.Write([]byte(payload))
-	return payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-}
-
-func (s *server) serverNodeToken(id uint64) string {
-	return s.signToken(claims{Issuer: s.id, NodeID: fmt.Sprintf("%032x", id), XSrcID: strconv.FormatUint(id, 10), NodeType: "server", RP5: 10})
-}
-
 func (s *server) verifyServerNode(r *http.Request, id uint64) error {
-	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	knownToken, known := s.peerToken(id)
-	c, err := s.verifyToken(token)
-	if err != nil || !known || c.NodeType != "server" || c.Expires != 0 || c.NodeID != fmt.Sprintf("%032x", id) || !hmac.Equal([]byte(token), []byte(knownToken)) {
-		return httpStatus(http.StatusUnauthorized)
+	nodeID, token := requestIdentity(r)
+	s.mu.RLock()
+	i := sort.Search(len(s.ring), func(i int) bool { return s.ring[i].ID >= id })
+	var p peer
+	if i < len(s.ring) && s.ring[i].ID == id {
+		p = s.ring[i]
+	}
+	s.mu.RUnlock()
+	expected := strings.TrimPrefix(p.Addr, "https://") + "|" + strconv.FormatUint(id, 10)
+	if p.Addr == "" || nodeID != expected || subtle.ConstantTimeCompare([]byte(token), []byte(p.AuthToken)) != 1 {
+		return httpStatus(401)
+	}
+	c, err := s.authenticate(r.Context(), nodeID, token, "")
+	if err != nil || c.NodeType != "server" {
+		return httpStatus(401)
 	}
 	return nil
 }
 
-func (s *server) verifyToken(token string) (claims, error) {
-	c, err := s.verifyTokenSignature(token)
-	if err != nil {
-		return claims{}, err
-	}
-	if c.Expires != 0 && c.Expires <= time.Now().Unix() {
-		return claims{}, errors.New("expired token")
-	}
-	return c, nil
+// Domain credentials are verified by their HTTPS authority, not locally signed.
+type domainIdentity struct {
+	NodeID   string `json:"node_id"`
+	Token    string `json:"token"`
+	XSrcID   string `json:"x_src_id"`
+	NodeType string `json:"node_type"`
+	RP5      int64  `json:"rp5"`
+	Expires  int64  `json:"expires,omitempty"`
 }
 
-func (s *server) verifyTokenSignature(token string) (claims, error) {
-	payload, signature, ok := strings.Cut(token, ".")
-	if !ok || len(token) > 8192 {
-		return claims{}, errors.New("invalid token")
+func authAuthority(raw string) (string, error) {
+	if raw == "" || len(raw) > 320 || strings.ContainsAny(raw, "/?#@|\\ \t\r\n") || strings.HasSuffix(raw, ":") {
+		return "", errors.New("invalid auth_domain")
 	}
-	data, err := base64.RawURLEncoding.DecodeString(payload)
-	if err != nil {
-		return claims{}, err
+	u, err := url.Parse("https://" + strings.ToLower(raw))
+	if err != nil || u.Hostname() == "" {
+		return "", errors.New("invalid auth_domain")
 	}
-	var c claims
-	if json.Unmarshal(data, &c) != nil || len(c.NodeID) != 32 || len(c.XSrcID) == 0 || len(c.XSrcID) > 256 || (c.NodeType != "" && c.NodeType != "node" && c.NodeType != "server") || (c.Expires < 0 || (c.Expires == 0 && c.NodeType != "server")) || len(c.AuthVerifyURL) > 2048 || c.RP5 < 0 {
-		return claims{}, errors.New("invalid claims")
+	if port := u.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return "", errors.New("invalid port")
+		}
 	}
-	if c.RP5 == 0 {
-		c.RP5 = 10
+	if net.ParseIP(u.Hostname()) == nil {
+		for _, label := range strings.Split(u.Hostname(), ".") {
+			if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+				return "", errors.New("invalid domain")
+			}
+			for _, ch := range label {
+				if !(ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9' || ch == '-') {
+					return "", errors.New("invalid domain")
+				}
+			}
+		}
 	}
-	if _, err := hex.DecodeString(c.NodeID); err != nil {
-		return claims{}, err
-	}
-	got, err := base64.RawURLEncoding.DecodeString(signature)
-	if err != nil {
-		return claims{}, err
-	}
-	mac := hmac.New(sha256.New, s.serverSecret)
-	mac.Write([]byte(payload))
-	if !hmac.Equal(got, mac.Sum(nil)) {
-		return claims{}, errors.New("invalid signature")
-	}
-	return c, nil
+	return u.Host, nil
 }
 
-func signBody(data, key []byte) string {
-	mac := hmac.New(sha256.New, key)
-	mac.Write(data)
-	return hex.EncodeToString(mac.Sum(nil))
-}
-
-func verifyBody(data []byte, signature string, key []byte) bool {
-	got, err := hex.DecodeString(signature)
-	if err != nil {
+func sameServerDomain(domain, current string) bool {
+	a, err := url.Parse("https://" + domain)
+	b, otherErr := url.Parse("https://" + current)
+	if err != nil || otherErr != nil {
 		return false
 	}
-	mac := hmac.New(sha256.New, key)
-	mac.Write(data)
-	return hmac.Equal(got, mac.Sum(nil))
+	host, own := a.Hostname(), b.Hostname()
+	if host == own {
+		return true
+	}
+	if net.ParseIP(host) != nil || net.ParseIP(own) != nil || own == "localhost" {
+		return false
+	}
+	parent := own
+	if _, tail, ok := strings.Cut(own, "."); ok {
+		suffix, _ := publicsuffix.PublicSuffix(tail)
+		if tail != suffix {
+			parent = tail
+		}
+	}
+	suffix, _ := publicsuffix.PublicSuffix(parent)
+	return parent != suffix && (host == parent || strings.HasSuffix(host, "."+parent))
 }
 
-func parseVerifyURL(raw string) (*url.URL, error) {
-	u, err := url.Parse(raw)
-	if err != nil || len(raw) > 2048 || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || u.Fragment != "" {
-		return nil, errors.New("invalid auth_verify_url")
+func authEndpoint(nodeID, token string) (*url.URL, string, error) {
+	domain, id, ok := strings.Cut(nodeID, "|")
+	if !ok || id == "" || len(nodeID) > 1024 || strings.ContainsAny(id, "|\r\n") {
+		return nil, "", errors.New("invalid node_id")
 	}
-	return u, nil
+	normalized, err := authAuthority(domain)
+	if err != nil || normalized != domain {
+		return nil, "", errors.New("invalid auth_domain")
+	}
+	path, secret, ok := strings.Cut(token, "|")
+	if !ok || secret == "" || len(token) > 8192 || !strings.HasPrefix(path, "/") || strings.HasPrefix(path, "//") {
+		return nil, "", errors.New("invalid token")
+	}
+	relative, err := url.Parse(path)
+	if err != nil || relative.IsAbs() || relative.Host != "" || relative.Fragment != "" || strings.ContainsAny(path, "\\\r\n") {
+		return nil, "", errors.New("invalid auth path")
+	}
+	u := &url.URL{Scheme: "https", Host: domain, Path: relative.Path, RawPath: relative.RawPath, RawQuery: relative.RawQuery}
+	query := u.Query()
+	query.Set("node_id", nodeID)
+	u.RawQuery = query.Encode()
+	return u, secret, nil
 }
 
-// verifyAuthorization never sends the node's bearer token to the verifier.
-func (s *server) verifyAuthorization(ctx context.Context, rawURL, action string) error {
-	if rawURL == "" {
-		return nil
+func requestIdentity(r *http.Request) (string, string) {
+	nodeID := r.URL.Query().Get("node_id")
+	if nodeID == "" {
+		nodeID = r.Header.Get("X-Node-ID")
 	}
-	u, err := parseVerifyURL(rawURL)
+	token := r.URL.Query().Get("token")
+	if token == "" && strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+		token = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	}
+	return nodeID, token
+}
+
+func (s *server) authenticate(ctx context.Context, nodeID, token, action string) (domainIdentity, error) {
+	c := domainIdentity{NodeID: nodeID, Token: token, XSrcID: nodeID, NodeType: "node", RP5: 10}
+	u, secret, err := authEndpoint(nodeID, token)
 	if err != nil {
-		return err
+		return c, err
 	}
+	query := u.Query()
 	if action != "" {
-		query := u.Query()
 		query.Set("action", action)
-		u.RawQuery = query.Encode()
+	} else {
+		query.Del("action")
 	}
+	u.RawQuery = query.Encode()
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	requestBody, _ := json.Marshal(map[string]string{"node_id": nodeID, "secret": secret})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(requestBody))
 	if err != nil {
-		return err
+		return c, err
 	}
+	req.Header.Set("Content-Type", "application/json")
 	client := *s.httpClient
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return c, errors.New("authorization unavailable")
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 17))
-	if err != nil || resp.StatusCode != http.StatusOK || len(body) > 16 || !strings.EqualFold(strings.TrimSpace(string(body)), "ok") {
-		return errors.New("authorization denied")
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8193))
+	if err != nil || resp.StatusCode != 200 || len(body) > 8192 {
+		return c, errors.New("authorization denied")
 	}
-	return nil
+	{
+		var approval struct {
+			Valid   json.RawMessage `json:"valid"`
+			XSrcID  string          `json:"x_src_id"`
+			RP5     int64           `json:"rp5"`
+			Expires int64           `json:"expires"`
+			Secret  string          `json:"secret_string"`
+		}
+		if json.Unmarshal(body, &approval) != nil || (string(approval.Valid) != `"true"` && string(approval.Valid) != "true") || approval.RP5 <= 0 || len(approval.XSrcID) > 256 || approval.Expires < 0 || (approval.Expires != 0 && approval.Expires <= time.Now().Unix()) {
+			return c, errors.New("authorization denied")
+		}
+		if approval.XSrcID != "" {
+			c.XSrcID = approval.XSrcID
+		}
+		c.RP5 = approval.RP5
+		c.Expires = approval.Expires
+		if action == "renew" && approval.Secret != "" {
+			path, _, _ := strings.Cut(token, "|")
+			c.Token = path + "|" + approval.Secret
+			if _, _, err := authEndpoint(nodeID, c.Token); err != nil {
+				return c, err
+			}
+		}
+	}
+	if sameServerDomain(u.Host, strings.TrimPrefix(s.addr, "https://")) {
+		c.NodeType = "server"
+	}
+	return c, nil
 }
 
 func (s *server) peer(w http.ResponseWriter, r *http.Request) error {
@@ -1470,11 +1479,17 @@ func (s *server) getPeerLink(owner peer) (*peerLink, error) {
 	address := "ws" + strings.TrimPrefix(owner.Addr, "http") + "/peer"
 	headers := http.Header{}
 	headers.Set("X-Server-ID", strconv.FormatUint(s.id, 10))
+	headers.Set("X-Node-ID", s.serverNodeID)
 	s.mu.RLock()
 	token := s.serverToken
 	s.mu.RUnlock()
 	headers.Set("Authorization", "Bearer "+token)
-	conn, resp, err := (&websocket.Dialer{Proxy: http.ProxyFromEnvironment, HandshakeTimeout: 10 * time.Second}).Dial(address, headers)
+	dialer := &websocket.Dialer{Proxy: http.ProxyFromEnvironment, HandshakeTimeout: 10 * time.Second}
+	if transport, ok := s.httpClient.Transport.(*http.Transport); ok {
+		dialer.TLSClientConfig = transport.TLSClientConfig
+		dialer.NetDialContext = transport.DialContext
+	}
+	conn, resp, err := dialer.Dial(address, headers)
 	if err != nil {
 		if resp != nil {
 			resp.Body.Close()

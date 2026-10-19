@@ -4,10 +4,8 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,30 +16,21 @@ func TestRenewAtOwnerClosesOnlyRenewedNode(t *testing.T) {
 	servers, urls := startCluster(t, 1)
 	node := createNode(t, urls[0].URL, "renewed")
 	other := createNode(t, urls[0].URL, "unrelated")
-	c, _ := servers[0].verifyToken(node.token)
-	c.NodeType = "server"
-	serverToken := servers[0].signToken(c)
 	first := connectNode(t, urls[0].URL, node.token, "")
-	second := connectNode(t, urls[0].URL, serverToken, "")
+	second := connectNode(t, urls[0].URL, node.token, "")
 	otherConn := connectNode(t, urls[0].URL, other.token, "")
 	waitConnections(t, servers[0], node.id, 2)
 	waitConnections(t, servers[0], other.id, 1)
-	for _, body := range []string{`{"valid_for":0}`, `{"valid_for":3600}`} {
-		req, _ := http.NewRequest(http.MethodPost, urls[0].URL+"/renew", strings.NewReader(body))
-		req.Header.Set("Authorization", "Bearer "+node.token)
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp.Body.Close()
-		if strings.Contains(body, ":0}") {
-			if resp.StatusCode != http.StatusBadRequest {
-				t.Fatalf("invalid renewal returned %s", resp.Status)
-			}
-			waitConnections(t, servers[0], node.id, 2)
-		} else if resp.StatusCode != http.StatusOK {
-			t.Fatalf("renewal returned %s", resp.Status)
-		}
+	req, _ := http.NewRequest(http.MethodPost, urls[0].URL+"/renew", nil)
+	req.Header.Set("Authorization", "Bearer "+node.token)
+	req.Header.Set("X-Node-ID", node.id)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("renewal returned %s", resp.Status)
 	}
 	for _, conn := range []*websocket.Conn{first, second} {
 		conn.SetReadDeadline(time.Now().Add(time.Second))
@@ -75,30 +64,23 @@ func TestRenewProxyReturnsOwnerDenialWithoutDisconnect(t *testing.T) {
 	if owner.ID == servers[1].id {
 		ownerIndex = 1
 	}
-	var calls atomic.Int64
-	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		if r.URL.Query().Get("action") != "renew" {
-			t.Error("renew verifier did not receive action=renew")
-		}
-		w.Write([]byte("denied"))
-	}))
-	defer verifier.Close()
 	conn := connectNode(t, owner.Addr, node.token, "")
 	waitConnections(t, servers[ownerIndex], node.id, 1)
-	c, _ := servers[0].verifyToken(node.token)
-	c.AuthVerifyURL = verifier.URL
-	token := servers[0].signToken(c)
+	account := accountFor(node)
+	account.mu.Lock()
+	account.denyRenew = true
+	account.mu.Unlock()
 	req, _ := http.NewRequest(http.MethodPost, urls[1-ownerIndex].URL+"/renew", strings.NewReader(`{"valid_for":60}`))
-	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Authorization", "Bearer "+node.token)
+	req.Header.Set("X-Node-ID", node.id)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized || string(body) != "Unauthorized\n" || resp.Header.Get("Content-Type") != "text/plain; charset=utf-8" || calls.Load() != 1 {
-		t.Fatalf("owner denial not proxied: %s %s, calls=%d", resp.Status, body, calls.Load())
+	if resp.StatusCode != http.StatusUnauthorized || string(body) != "Unauthorized\n" || resp.Header.Get("Content-Type") != "text/plain; charset=utf-8" || account.renewCalls != 1 {
+		t.Fatalf("owner denial not proxied: %s %s, calls=%d", resp.Status, body, account.renewCalls)
 	}
 	waitConnections(t, servers[ownerIndex], node.id, 1)
 	data, _ := encodePacket(packet{Type: "data", Dest: node.id, Payload: "denial-kept-socket"})
@@ -126,6 +108,7 @@ func TestRenewProxyBoundsRingDisagreement(t *testing.T) {
 	}
 	req, _ := http.NewRequest(http.MethodPost, urls[0].URL+"/renew", nil)
 	req.Header.Set("Authorization", "Bearer "+node.token)
+	req.Header.Set("X-Node-ID", node.id)
 	resp, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
 	if err != nil {
 		t.Fatal(err)

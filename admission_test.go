@@ -1,12 +1,8 @@
 package main
 
 import (
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
-	"net/http"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 
@@ -195,67 +191,5 @@ func TestRateDropIsPerConnection(t *testing.T) {
 	got, err = decodePacket(raw)
 	if err != nil || got.PacketID != "independent" {
 		t.Fatalf("a rate-dropped packet reached the destination: %+v, %v", got, err)
-	}
-}
-
-func TestRateClaimCreationAndRenewal(t *testing.T) {
-	servers, urls := startCluster(t, 1)
-	for _, tc := range []struct {
-		body string
-		want int64
-	}{
-		{`{"x_src_id":"default"}`, 10},
-		{`{"x_src_id":"custom","rp5":37}`, 37},
-		{`{"x_src_id":"bad","rp5":0}`, 0},
-		{`{"x_src_id":"bad","rp5":-1}`, 0},
-		{`{"x_src_id":"bad","rp5":1.5}`, 0},
-		{`{"x_src_id":"bad","rp5":"fast"}`, 0},
-	} {
-		resp, err := http.Post(urls[0].URL+"/create", "application/json", strings.NewReader(tc.body))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if tc.want == 0 {
-			resp.Body.Close()
-			if resp.StatusCode != http.StatusBadRequest {
-				t.Fatalf("invalid rp5 returned %s", resp.Status)
-			}
-			continue
-		}
-		var result struct {
-			Token string `json:"token"`
-			RP5   int64  `json:"rp5"`
-		}
-		err = json.NewDecoder(resp.Body).Decode(&result)
-		resp.Body.Close()
-		if err != nil || resp.StatusCode != http.StatusOK || result.RP5 != tc.want {
-			t.Fatalf("create rate claim: %+v, %v", result, err)
-		}
-		c, err := servers[0].verifyToken(result.Token)
-		if err != nil || c.RP5 != tc.want {
-			t.Fatalf("unsigned or incorrect rate: %+v, %v", c, err)
-		}
-		req, _ := http.NewRequest(http.MethodPost, urls[0].URL+"/renew", strings.NewReader(`{"rp5":1000000}`))
-		req.Header.Set("Authorization", "Bearer "+result.Token)
-		resp, err = http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		err = json.NewDecoder(resp.Body).Decode(&result)
-		resp.Body.Close()
-		if err != nil || resp.StatusCode != http.StatusOK {
-			t.Fatalf("renew rate claim: %s, %v", resp.Status, err)
-		}
-		c, err = servers[0].verifyToken(result.Token)
-		if err != nil || c.RP5 != tc.want || result.RP5 != tc.want {
-			t.Fatalf("renew changed the rate allowance: %+v, %v", c, err)
-		}
-	}
-	legacy, _ := json.Marshal(map[string]any{"issuer": servers[0].id, "node_id": strings.Repeat("a", 32), "x_src_id": "legacy", "expires": time.Now().Add(time.Hour).Unix()})
-	payload := base64.RawURLEncoding.EncodeToString(legacy)
-	mac, _ := hex.DecodeString(signBody([]byte(payload), servers[0].serverSecret))
-	c, err := servers[0].verifyToken(payload + "." + base64.RawURLEncoding.EncodeToString(mac))
-	if err != nil || c.RP5 != 10 {
-		t.Fatalf("legacy token did not get the default allowance: %+v, %v", c, err)
 	}
 }

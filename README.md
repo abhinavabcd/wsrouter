@@ -1,137 +1,103 @@
 # wsrouter
 
-A Go WebSocket router with a consistent hash ring. All production code lives in `main.go`; tests remain in `*_test.go` files. Clients have random `node_id` values; servers have fixed ring positions. The first server coordinates membership. All servers use the configured `SERVER_SECRET` to sign client and server tokens. The primary issues a non-expiring server token when a server joins, includes active server tokens in signed snapshots, and pushes a new snapshot to existing servers when membership changes. Signing secrets are never included in snapshots. Snapshot epochs and versions keep concurrent updates in order.
+A Go WebSocket router with a consistent hash ring. All production code is in `main.go`. Authentication uses HTTPS verifiers, and every node ID contains its authentication domain. There is no shared signing secret or locally signed token.
 
 ## Run
 
-Set the same `SERVER_SECRET` on every server (`server_secret` is also accepted). It signs all node and server tokens, membership updates, and snapshots. Optionally set a separate shared join credential with `--cluster_secret`, `CLUSTER_SECRET`, or `cluster_secret` (in that order); it defaults to `SERVER_SECRET`. Both secrets must contain at least 32 bytes. New servers prove possession of both the signing secret and join credential to the primary, which issues their non-expiring `node_type: "server"` token. Registered servers use that token for subsequent heartbeats and peer WebSocket authentication. Give servers unique, well-spaced positions between `0` and `9223372036854775807`.
+All advertised addresses, verifier requests, and peer connections use HTTPS/WSS with certificate verification enabled. The listening port comes from `--addr`, defaulting to 443. Omitting `--clusteraddr` starts a leader. Give servers unique, well-spaced ring positions between 0 and 9223372036854775807.
 
 ```sh
-export SERVER_SECRET='replace-with-at-least-32-random-bytes'
-cd wsrouter
-go run . --addr=http://localhost:8080 --id=0
+go run . --addr=https://sub1.example.com:8443 --ssl_certs=/path/to/certs --id=0
+go run . --addr=https://sub2.example.com:8443 --ssl_certs=/path/to/certs \
+  --clusteraddr=https://sub1.example.com:8443 --id=4611686018427387904
 ```
 
-On a second host, with the same secret:
+The certificate directory should contain a matching `.pem` certificate chain and `.key` private key. `fullchain.pem`/`privkey.pem` and `public.pem`/`private.pem` are also supported. Each server must trust the certificates used by its peers and authentication authorities. See [local HTTPS testing](DOMAIN_AUTH.md#local-https-tests) for mkcert and automated test fixtures. The container image installs system CA certificates; a local CA must also be trusted inside the container.
 
-```sh
-go run . --addr=http://localhost:8081 --clusteraddr=http://localhost:8080 --id=4611686018427387904
-```
+## Create and connect
 
-Omitting `--clusteraddr` starts a leader. The listening port comes from `--addr`, defaulting to 80 for HTTP and 443 for HTTPS; the server binds that port on all interfaces. There is no `--listen` option. HTTPS requires `--ssl_certs`.
-
-The advertised URLs must be reachable by clients and the other servers. Use HTTPS/WSS across machines to protect bearer credentials and message traffic. The first server must remain available for joins and ring refreshes.
-
-### Direct TLS and certificate reload
-
-Pass `--ssl_certs` to serve HTTPS and WSS directly. Set `--addr` to an `https://` URL and provide a directory containing one certificate chain and its private key. Name them with the same stem, such as `server.pem` and `server.key`. The common `fullchain.pem`/`privkey.pem` and `public.pem`/`private.pem` pairs also work. The certificate must cover the advertised hostname and be trusted by clients and other servers.
-
-```sh
-go run . --addr=https://localhost:8443 --ssl_certs=/path/to/ssl_certs --id=0
-```
-
-After replacing both certificate files, send a signed `POST /reload` to that server. A successful reload returns HTTP `204` and changes the certificate used for new TLS connections; existing WebSockets stay connected. An invalid pair returns HTTP `502` and leaves the previous certificate in use. The endpoint requires `X-Cluster-Signature`, the hex HMAC-SHA256 of `POST /reload` using `SERVER_SECRET`:
-
-```sh
-signature=$(printf 'POST /reload' | openssl dgst -sha256 -hmac "$SERVER_SECRET" | awk '{print $NF}')
-curl -X POST -H "X-Cluster-Signature: $signature" https://localhost:8443/reload
-```
-
-Run the reload request on each server whose certificate files changed. Without `--ssl_certs`, the router continues to serve plain HTTP and `/reload` is unavailable.
-
-## Client flow
-
-1. `POST /create` with JSON `{"x_src_id":"your-client-id"}`. The response contains `node_id`, `node_type`, `token`, Unix `expires`, `rp5`, and the current owner `address` when the ring is available. Tokens identify the server that issued them. Add `"valid_for":3600` to set the lifetime in seconds; if omitted, the lifetime is 90 days (`7776000` seconds). `valid_for` must be positive. Add `"rp5":100` to allow 100 incoming packets per five-second bucket per connection; the default is 10.
-2. Open `GET /connect?token=TOKEN` as a WebSocket, or send `Authorization: Bearer TOKEN` on the upgrade request. A wrong server returns HTTP `421` and JSON `{"address":"http://owner:port"}`. Retry at that address with the same token, converting `http` to `ws` or `https` to `wss`. Browser WebSocket APIs cannot read the `421` response body; browsers can call `GET /locate` with `Authorization: Bearer TOKEN` to obtain the current `address` via CORS before retrying.
-3. `POST /renew` with `Authorization: Bearer TOKEN`. Any server accepts the request and proxies it to the node's current ring owner, which issues a fresh token for the same node ID and node type and disconnects all existing sockets for that node before returning success. Reconnect with the returned token. Without an external verifier, renew before expiry. Tokens carrying `auth_verify_url` can also be renewed after expiry if that verifier approves. The optional JSON body `{"valid_for":3600}` sets its new lifetime; the default is 90 days. Keep the newest token for reconnects.
-4. Send JSON packets as WebSocket **text** messages. Regular nodes (`node_type` omitted or `"node"`) leave `src_id` and `x_src_id` out; the router fills them from the verified token and sets `src_node_id` to the authenticated node ID, replacing any supplied `src_node_id`. Supply `_id` if you already have one; otherwise the router assigns one.
-5. On a `reconnect` packet, read its `payload` as the new server's HTTP base URL and connect there with the same token. The old connection closes after sending the packet.
-
-The `type` field identifies the payload format so the receiver knows how to decode `payload`. Delivery feedback uses `type: "status"` and a string payload of `"success"` or `"failed"`; there is no separate `status` field. The `payload` field is always a string. For binary data, clients should base64-encode the bytes before sending and decode them after receiving. Use `dest_node_id` for one destination or `dest_node_ids` for 1 to 1,024 destinations; do not include both. Example client packet:
+`POST /create` accepts these required fields:
 
 ```json
-{"type":"data","dest_node_id":"0123456789abcdef0123456789abcdef","payload":"AP8="}
+{"auth_domain":"auth.example.com","path":"/verify","secret_string":"opaque-secret"}
 ```
 
-To send the same payload to multiple nodes:
+Example response:
 
 ```json
-{"type":"data","dest_node_ids":["0123456789abcdef0123456789abcdef","11111111111111111111111111111111"],"payload":"AP8="}
+{"node_id":"auth.example.com|0123456789abcdef0123456789abcdef","token":"/verify|opaque-secret","address":"https://sub1.example.com:8443"}
 ```
 
-The router sends a separate copy to each destination. Each delivered copy has its own `dest_node_id` and no `dest_node_ids` field. All copies share one `_id`, and the source receives a `status` for each destination; each status uses that destination as `src_node_id` and `src_id`.
+`auth_domain` is a hostname with an optional port, without a scheme or path. `path` starts with `/` and can include query parameters. The first `|` separates the path from the secret, so the secret may contain additional `|` characters. Creation constructs the credentials; authentication occurs when they are used. The external authority must already recognize the supplied secret and decide which node IDs it permits.
 
-Example delivered packet:
+Connect to `/connect` using URL-encoded `node_id` and `token` query parameters. Non-browser clients can instead send `X-Node-ID` and `Authorization: Bearer TOKEN`. Both identity and token are required. The router sends:
+
+```http
+POST https://auth.example.com/verify?node_id=auth.example.com%7C0123456789abcdef0123456789abcdef
+Content-Type: application/json
+
+{"node_id":"auth.example.com|0123456789abcdef0123456789abcdef","secret":"opaque-secret"}
+```
+
+The verifier must return HTTP 200 with JSON:
 
 ```json
-{"_id":"a18b9f56c718c449-7","type":"data","dest_node_id":"0123456789abcdef0123456789abcdef","src_id":"fedcba9876543210fedcba9876543210","src_node_id":"fedcba9876543210fedcba9876543210","x_src_id":"account-42","payload":"AP8="}
+{"valid":"true","rp5":10}
 ```
 
-The server assigns `_id` only when it is absent or empty, and preserves a supplied value during forwarding and replay.
+Boolean `true` is also accepted. `rp5` is required and must be a positive integer. Plain `ok`, false/missing validity, invalid rates, redirects, certificate failures, and timeouts deny authentication. Verification has a five-second timeout and an 8 KiB response limit. The `node_id` query parameter always comes from the requested identity, replacing any existing values. Other query parameters are preserved, except `action`, which is controlled by the router.
 
-Messages also carry `timestamp`, an integer Unix time in milliseconds. A regular node may supply a timestamp in the inclusive range from the server's receive time minus 8,000 milliseconds to the server's receive time. An accepted timestamp is preserved. Older timestamps and future timestamps produce a `drop` response with `payload: "invalid_time"`. For server-token messages and peer forwarding, any existing timestamp (including zero) is preserved without a drift check. A missing or null timestamp is filled with the current time. Fanout copies and replays retain the original timestamp. Router-generated feedback carries its own creation timestamp.
+The verifier can additionally return `x_src_id` and `expires` (Unix seconds). Without them, `x_src_id` defaults to the node ID and validity is decided by the authority on each authentication. A returned expiry must be in the future. `/create` no longer accepts trusted identity, rate, or lifetime claims from the caller: the authority supplies them. Old HMAC tokens are incompatible with this protocol.
 
-The router sends feedback to the source using the same ring:
+`GET /locate` takes the same credentials, verifies them, and returns the ring owner's `address`. `/connect` returns HTTP 421 and `{"address":"https://owner:port"}` if the node belongs elsewhere. Browser WebSocket APIs cannot read that response body, so browser clients should use `/locate` before connecting. WebSocket origins from any domain are accepted, and HTTP endpoints support CORS.
+
+## Renewal
+
+`POST /renew` takes the same node ID and token. Any server proxies the request to the ring owner, which calls the verifier with `action=renew`. Only an approving JSON response allows renewal. The owner then disconnects all existing sockets for that node and returns its identity, token, and verifier-provided policy. Denied renewal leaves existing sockets connected. Proxying has a ten-second timeout and a four-hop limit.
+
+An authority can return `secret_string` in its renewal response to rotate the credential. The router returns the existing path combined with that new secret. Without a replacement secret, the token stays the same. The authority must recognize the new secret and revoke the old one when rotation is intended; the router cannot mint credentials for an external backend. A verifier may approve renewal after its own expiry policy has denied normal connections, returning a fresh future `expires` value if it uses that field.
+
+## Cluster authentication
+
+Each process generates a local random secret and uses `advertised-host[:port]|ring-position` as its node ID and `/server|local-secret` as its token. A follower POSTs `server_domain`, `id`, and `secret` to the primary's `/server` endpoint. The primary checks the domain relationship and calls the joining server's HTTPS `/server?node_id=...` endpoint with JSON containing `node_id` and `secret`. That endpoint approves only the process's own identity and secret, using the same JSON response format. Registration also runs during the minute membership refresh, allowing a restarted process to register its new credential.
+
+An authenticated authority matching the server's hostname or permitted parent domain identifies a server node. For `sub1.example.com`, the parent is `example.com`; for `sub1.x.y.com`, it is `x.y.com`. Siblings and descendants of that parent are trusted after HTTPS verification. Public suffixes such as `co.uk` and `github.io` are excluded using the public suffix list. IP addresses and `localhost` use exact hostname matching; ports do not change domain ownership.
+
+The primary distributes server credentials in HTTPS ring snapshots. Snapshots authenticate the configured primary, and `/peer` WebSocket upgrades require a registered server ID, matching credential, and successful HTTPS verification. Membership changes are pushed immediately; epochs and versions order updates. Servers disappear from the ring after three minutes without refresh. The primary must remain available for joins and ring refreshes.
+
+Server nodes can supply their own `src_id`, `src_node_id`, `x_src_id`, timestamp, and status messages. Those fields pass through unchanged. Regular nodes have source identity assigned by the router and cannot send `status` packets.
+
+After replacing certificate files, `POST /reload` on that server with its own server node ID in `X-Node-ID` and its local server token in `Authorization: Bearer TOKEN`. A successful reload returns 204 and updates new TLS connections; existing sockets remain open. Invalid files return 502 and retain the previous certificate. These administrative credentials are available to trusted cluster members through the ring snapshot; they are never logged or exposed by `/health`.
+
+## Messages and delivery
+
+Send JSON text frames with string payloads. Base64-encode binary data when needed:
 
 ```json
-{"_id":"a18b9f56c718c449-7","type":"status","dest_node_id":"fedcba9876543210fedcba9876543210","src_id":"0123456789abcdef0123456789abcdef","src_node_id":"0123456789abcdef0123456789abcdef","payload":"success"}
+{"_id":"message-1","type":"data","dest_node_id":"auth.example.com|destination-id","payload":"AP8="}
 ```
 
-`success` means at least one destination connection accepted the packet into its send queue. An offline destination or a forwarding failure returns `type: "status"`, `payload: "failed"`, and the original `_id`. On an unexpected socket close, packets in that socket's `tcp_keep_alive` window are rerouted first with the same `_id`. If a connection is available at the current owner, replay produces `success`; otherwise it produces `failed`. The server also keeps receipts for 10 seconds for packets outside the replay window; those produce `failed` only if this server still owns the node and no destination connections remain. A packet retried from the replay window does not also get a receipt-based failure. `success` is therefore an enqueue notice, not a final delivery guarantee. A client may receive another `success` if a recent packet is replayed after a connection drops. Feedback identifies the original destination in `src_node_id` (also in `src_id` for compatibility); use `src_node_id` together with `_id` to correlate each destination's result. Regular clients cannot send `status`.
+Use `dest_node_ids` for fanout (1–1,024 destinations), or `dest_node_id` for one destination, but not both. Each copy has one `dest_node_id`, preserves the same `_id`, and routes to every connection for that destination. Missing or empty `_id` values are generated. Hashing includes the whole domain-prefixed node ID.
 
-Example failure feedback:
+Regular nodes may provide an integer Unix millisecond `timestamp` between the server's receive time minus 8,000 milliseconds and its current time, inclusive. A missing/null timestamp is filled by the server. An invalid time produces `type: "drop", payload: "invalid_time"`, with the other input fields copied. Server nodes preserve supplied timestamps without drift checks. Replay preserves the original ID and timestamp.
+
+The authority's `rp5` limits each regular connection using fixed server-time buckets (`UnixMilli / 5000`). One incoming packet consumes one allowance, including invalid timestamps and fanout requests. Excess traffic gets `type: "drop", payload: "rate_limited"`. Dropped packets are returned only to that socket and are not routed. Server nodes bypass these limits.
+
+Delivery feedback uses the same ring:
 
 ```json
-{"_id":"a18b9f56c718c449-7","type":"status","dest_node_id":"fedcba9876543210fedcba9876543210","src_id":"0123456789abcdef0123456789abcdef","src_node_id":"0123456789abcdef0123456789abcdef","payload":"failed"}
+{"_id":"message-1","type":"status","payload":"success","dest_node_id":"auth.example.com|sender-id","src_node_id":"auth.example.com|destination-id","src_id":"auth.example.com|destination-id"}
 ```
 
-WebSocket origins from any domain are accepted. HTTP routes send `Access-Control-Allow-Origin: *` and answer CORS preflight requests. The service uses bearer tokens, not cookies. `/create` accepts the caller's `x_src_id` as supplied; if that value represents a trusted account, authenticate callers at a gateway.
+`success` means a destination connection accepted the packet into its send queue. An unavailable destination or forwarding failure produces `payload: "failed"`. Feedback identifies the original receiver in `src_node_id` and legacy `src_id`, so correlate by `src_node_id` plus `_id`.
 
-### Rate limits and dropped packets
+Servers ping client sockets every `TCP_KEEP_ALIVE` seconds (default 30), overridable through `tcp_keep_alive` on `/connect`. Server connections default to 3 seconds. A socket that does not answer closes after a further ten seconds. Packets sent toward a client socket during its keepalive window are rerouted on unexpected disconnect before deciding failure. Peer links retain the last three seconds of packets in both directions and replay them on disconnect. Replays preserve `_id` and stop after three attempts. Older receipts are retained for ten seconds and fail only when the destination remains locally owned and has no connections.
 
-Set a positive integer `rp5` when issuing the token through `/create` (the existing endpoint previously called `/generate`):
+A shared cleanup job scans active histories and recent receipts; there is no timer per idle node. Replay is best effort and can create duplicates. Process crashes lose in-memory queues. `success` is an enqueue notice, not a final delivery guarantee.
 
-```json
-{"x_src_id":"account-42","rp5":100,"valid_for":3600}
-```
+Packets are limited to 1 MiB. Each client has a 4,096-packet send queue and a 1,024-packet routing queue capped at 4 MiB. Peer feedback has a separate prioritized backlog capped at 64 MiB; feedback enqueue never blocks routing workers. Overload failures appear in `/health` counters. `/health` also reports ring size and distinct local nodes.
 
-`rp5` is included in the signed claims and retained during renewal. Tokens issued before this field existed default to 10. Each regular-node socket has its own counter for the server-time bucket `UnixMilli / 5000`; changing the packet timestamp cannot reset it. Counters reset lazily on the first packet in a new bucket, without a per-connection timer. One incoming packet consumes one allowance, including a packet with an invalid timestamp; a packet containing multiple destinations still counts once. Once the allowance is exhausted, additional packets produce `payload: "rate_limited"` before timestamp validation. Server-token sockets and cluster peer links bypass both the rate limit and timestamp drift check.
-
-Rejected packets are returned only to the sending socket, with `type` replaced by `drop` and `payload` replaced by the reason. The original `_id`, timestamp, destination fields, and extra JSON fields are copied; missing IDs and timestamps are assigned normally, and source identity is filled from the authenticated token. The packet is not routed and produces no destination delivery feedback. A drop leaves the socket open so the node can send again when its next bucket starts.
-
-```json
-{"_id":"message-42","type":"drop","payload":"invalid_time","timestamp":1700000000000,"dest_node_id":"destination","src_id":"sender","src_node_id":"sender","x_src_id":"account-42"}
-```
-
-The same format is used with `payload: "rate_limited"` for excess traffic. Because these are fixed wall-clock buckets, a connection can use an allowance at the end of one bucket and a fresh allowance immediately after the boundary.
-
-### External authorization and expired-token renewal
-
-Add `auth_verify_url` to the existing `POST /create` request (`/generate` remains removed):
-
-```json
-{"x_src_id":"account-42","auth_verify_url":"https://example.com/account-42/verify","valid_for":3600}
-```
-
-The URL becomes part of the HMAC-signed token claims. Before each new WebSocket connection, the router makes a GET request to that URL. HTTP `200` with a body of `ok` allows authentication; matching is case insensitive and surrounding whitespace is ignored, so `OK` also works. Any other response, redirect, network error, or timeout denies authentication with HTTP `401`. Requests have a five-second timeout. `/locate` applies the same check. Tokens without this field use the existing local signature and expiry checks without an outbound request.
-
-On every `/renew` request for a token carrying this field, the node's current ring owner calls the same URL with `action=renew`, for example `https://example.com/account-42/verify?action=renew`. Other query parameters are preserved. An approving response permits renewal even after the token expires, provided its signature still verifies with `SERVER_SECRET`. A denied response blocks renewal even before expiry and leaves existing sockets connected. Renewal preserves `auth_verify_url`, node identity, and node type; it cannot remove or replace the verifier. The URL must use HTTP or HTTPS and contain no embedded credentials or fragment. The router sends no bearer token to the verifier, so encode the account or authorization reference into the URL itself.
-
-Servers proxy renewal request bodies, authorization, response status, and response headers to and from the owner. Only the owner performs external authorization. Forwarding has a ten-second timeout and a four-hop limit for inconsistent ring snapshots. Successful renewal closes the node's current sockets, including server-token sockets; unrelated nodes and cluster peer links stay connected. Older signed tokens retain their normal validity, so revoking future reconnects still requires expiry or denial by `auth_verify_url`.
-
-Changing the verifier response revokes future authentication and renewal; it does not close sockets that are already open. Verifier checks are not cached.
-
-For a trusted server connection, call `POST /create` with `{"x_src_id":"router-name","node_type":"server"}` and an `X-Cluster-Signature` header containing the hex HMAC-SHA256 of the exact request body with `SERVER_SECRET`. Server tokens can send packets with their own `src_id`, `src_node_id`, `x_src_id`, and `_id`; the router preserves supplied values while forwarding, including `status` packets. `src_node_id` identifies the sender for routing feedback; older server messages may provide `src_id` instead. Server-provided identity fields pass through unchanged. A missing `_id` is generated. The server-token request requires the cluster signature because these connections may send on behalf of other nodes.
-
-## Routing
-
-A server hashes the UTF-8 node ID with SHA-256, uses the first 63 bits as a ring position, and chooses the first server at or after it, wrapping around. A packet is sent to every active connection for its destination node. Servers forward packets over persistent `/peer` WebSockets authenticated with the non-expiring server bearer token issued by the primary and distributed in the ring snapshot. Feedback uses a separate prioritized backlog capped at 64 MiB per peer link; enqueueing feedback never blocks routing workers, preventing reciprocal queue stalls. If that cap is reached, feedback is rejected and counted in `status_errors`. These links ping every 3 seconds, keep the last 3 seconds of packets sent and received, and reroute those packets when a link drops. The same `_id` is preserved. Membership heartbeats occur every minute; membership changes are pushed immediately, and a server is removed after three minutes without a heartbeat. `GET /health` reports the current ring size, number of distinct local node IDs, and counts of data routing errors and status messages that could not be routed.
-
-Packets are limited to 1 MiB. Each client connection has a bounded 4,096-packet send queue and a 1,024-packet routing queue capped at 4 MiB of pending input; clients that overrun either queue are disconnected. Routing runs separately from the WebSocket reader so ping and pong frames remain responsive during forwarding. Servers send client WebSocket pings every `TCP_KEEP_ALIVE` seconds (default `30`; set it as a positive-seconds environment variable). A connection may override this with `tcp_keep_alive=SECONDS` on `/connect`; trusted server-token connections default to 3 seconds. The server retains packets sent toward each client socket for at least its keepalive interval and reroutes recent packets if that socket closes unexpectedly. A connection that does not answer a ping closes after a further ten seconds. With a longer ping interval, detection of a dropped connection can take the interval plus ten seconds. Each node has its own connection and receipt lock, so packet delivery to different nodes can run concurrently. One server-wide cleanup ticker scans only active replay histories and nodes with recent receipts; idle nodes have no receipt timer or cleanup work. Replay attempts are capped at three per packet to avoid loops. Delivery and replay are best effort and may produce duplicates with the same `_id`; callers needing exactly-once handling should deduplicate. A server process crash loses its in-memory queues, so it cannot replay packets or emit later `failed` notices for them. Membership changes can briefly interrupt delivery. Tokens continue to verify across server restarts and issuer departures while `SERVER_SECRET` remains the same. Changing it invalidates previously issued tokens. Primary-issued server tokens have no expiry; they authenticate peer connections only while the corresponding server ID is present in the receiving server's ring. Application server tokens issued through `/create` still use the requested `valid_for` lifetime.
-
-The first server and full membership snapshots are practical limits on cluster size. This design scales across servers but is neither literally infinite nor coordinator fault tolerant.
-
-HTTP handlers share one error response path. Validation and authentication failures keep their HTTP status codes, such as `400` and `401`. Unexpected operational failures return `502 Bad Gateway` with a short standard response. WebSocket errors close the socket and use the existing replay and feedback behavior.
+The full ring snapshots and single membership coordinator impose practical scaling limits; this system is not infinitely scalable or coordinator fault tolerant.
 
 ## Tests
 
@@ -140,4 +106,4 @@ go test -race ./...
 WSROUTER_STRESS=1 go test -run TestStressFiveServers -count=1 -v -timeout=10m
 ```
 
-The opt-in stress test starts five servers and creates 1,000 clients total, 200 through each server, with an explicit `rp5` allowance equal to the client count so the throughput test does not exercise the default limit of 10. Half the clients send one batch to the other 999 destinations in random order; the other half send individual packets. The test waits for all 999,000 data packets and 999,000 `success` statuses, checking sender identity and payload while deduplicating replayed packets by their preserved `_id`. It advances receipt expiry in the test harness before disconnecting all clients, so teardown does not generate another million expected `failed` notices. For a smaller local smoke run, set `WSROUTER_STRESS_NODES=50` alongside `WSROUTER_STRESS=1`.
+Tests use trusted local TLS certificates with hostname verification enabled. The stress test starts five HTTPS servers and 1,000 WSS clients, 200 created through each server. Every client sends to the other 999, mixing fanout and individual packets. It waits for 999,000 data packets and 999,000 success statuses, checking identity and deduplicating replay. The verifier supplies `rp5: 1000` for these clients. Set `WSROUTER_STRESS_NODES=50` for a smaller run.
