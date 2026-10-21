@@ -1,291 +1,188 @@
-{
-  "apiVersion": "v1",
-  "kind": "List",
-  "items": [
-    {
-      "apiVersion": "v1",
-      "kind": "Service",
-      "metadata": {
-        "name": "wsrouter-0",
-        "namespace": "wsrouter",
-        "labels": {
-          "app.kubernetes.io/name": "wsrouter",
-          "wsrouter-shard": "wsrouter-0"
-        },
-        "annotations": {
-          "cloud.google.com/l4-rbs": "enabled"
-        }
-      },
-      "spec": {
-        "type": "LoadBalancer",
-        "loadBalancerIP": "34.118.100.7",
-        "externalTrafficPolicy": "Cluster",
-        "publishNotReadyAddresses": true,
-        "selector": {
-          "app.kubernetes.io/name": "wsrouter",
-          "wsrouter-shard": "wsrouter-0"
-        },
-        "ports": [
-          {
-            "name": "https",
-            "port": 443,
-            "targetPort": 443
-          },
-          {
-            "name": "http-acme",
-            "port": 80,
-            "targetPort": 8080
-          }
-        ]
-      }
-    },
-    {
-      "apiVersion": "v1",
-      "kind": "Service",
-      "metadata": {
-        "name": "wsrouter-0-internal",
-        "namespace": "wsrouter",
-        "labels": {
-          "app.kubernetes.io/name": "wsrouter",
-          "wsrouter-shard": "wsrouter-0"
-        }
-      },
-      "spec": {
-        "clusterIP": "None",
-        "selector": {
-          "app.kubernetes.io/name": "wsrouter",
-          "wsrouter-shard": "wsrouter-0"
-        },
-        "ports": [
-          {
-            "name": "https",
-            "port": 443,
-            "targetPort": 443
-          }
-        ]
-      }
-    },
-    {
-      "apiVersion": "apps/v1",
-      "kind": "StatefulSet",
-      "metadata": {
-        "name": "wsrouter-0",
-        "namespace": "wsrouter",
-        "labels": {
-          "app.kubernetes.io/name": "wsrouter",
-          "wsrouter-shard": "wsrouter-0"
-        }
-      },
-      "spec": {
-        "replicas": 1,
-        "serviceName": "wsrouter-0-internal",
-        "selector": {
-          "matchLabels": {
-            "app.kubernetes.io/name": "wsrouter",
-            "wsrouter-shard": "wsrouter-0"
-          }
-        },
-        "template": {
-          "metadata": {
-            "labels": {
-              "app.kubernetes.io/name": "wsrouter",
-              "wsrouter-shard": "wsrouter-0"
-            }
-          },
-          "spec": {
-            "automountServiceAccountToken": false,
-            "terminationGracePeriodSeconds": 30,
-            "nodeSelector": {
-              "cloud.google.com/gke-nodepool": "servers-e2-standard"
-            },
-            "securityContext": {
-              "runAsUser": 65532,
-              "runAsGroup": 65532,
-              "fsGroup": 65532,
-              "fsGroupChangePolicy": "OnRootMismatch",
-              "seccompProfile": {
-                "type": "RuntimeDefault"
-              }
-            },
-            "containers": [
-              {
-                "name": "router",
-                "image": "europe-central2-docker.pkg.dev/sukhiba-e4413/apps/wsrouter@sha256:7a9a36d235772ad3697b701a1eb49d20a0047ee708db1266f09169d77412f113",
-                "imagePullPolicy": "IfNotPresent",
-                "command": [
-                  "/bin/sh",
-                  "-ec"
-                ],
-                "args": [
-                  "until [ -r /tls/current/server.pem ] && [ -r /tls/current/server.key ]; do sleep 5; done; exec \"$@\"",
-                  "router",
-                  "/usr/local/bin/wsrouter",
-                  "--addr=https://0.nl.chatapp.world",
-                  "--id=0",
-                  "--ssl_certs=/tls/current"
-                ],
-                "ports": [
-                  {
-                    "name": "https",
-                    "containerPort": 443
-                  }
-                ],
-                "resources": {
-                  "requests": {
-                    "cpu": "100m",
-                    "memory": "128Mi"
-                  },
-                  "limits": {
-                    "cpu": "2",
-                    "memory": "1Gi"
-                  }
-                },
-                "securityContext": {
-                  "runAsUser": 65532,
-                  "runAsNonRoot": true,
-                  "allowPrivilegeEscalation": false,
-                  "readOnlyRootFilesystem": true,
-                  "capabilities": {
-                    "drop": [
-                      "ALL"
-                    ],
-                    "add": [
-                      "NET_BIND_SERVICE"
-                    ]
-                  }
-                },
-                "readinessProbe": {
-                  "httpGet": {
-                    "scheme": "HTTPS",
-                    "path": "/health",
-                    "port": 443
-                  },
-                  "periodSeconds": 5
-                },
-                "volumeMounts": [
-                  {
-                    "name": "tls",
-                    "mountPath": "/tls",
-                    "readOnly": true
-                  }
-                ]
-              },
-              {
-                "name": "certbot",
-                "image": "certbot/certbot@sha256:f70ad0adbb7e117f0fe42a63c553f28ea451edabc0148757b6efcd9735acaa20",
-                "command": [
-                  "python",
-                  "-u",
-                  "/scripts/certbot-runner.py"
-                ],
-                "env": [
-                  {
-                    "name": "DOMAIN",
-                    "value": "0.nl.chatapp.world"
-                  },
-                  {
-                    "name": "EXPECTED_IP",
-                    "value": "34.118.100.7"
-                  }
-                ],
-                "ports": [
-                  {
-                    "name": "http-acme",
-                    "containerPort": 8080
-                  }
-                ],
-                "resources": {
-                  "requests": {
-                    "cpu": "25m",
-                    "memory": "64Mi"
-                  },
-                  "limits": {
-                    "cpu": "500m",
-                    "memory": "256Mi"
-                  }
-                },
-                "securityContext": {
-                  "runAsUser": 0,
-                  "allowPrivilegeEscalation": false,
-                  "capabilities": {
-                    "drop": [
-                      "ALL"
-                    ]
-                  }
-                },
-                "readinessProbe": {
-                  "httpGet": {
-                    "path": "/health",
-                    "port": 8080
-                  },
-                  "periodSeconds": 5
-                },
-                "livenessProbe": {
-                  "httpGet": {
-                    "path": "/health",
-                    "port": 8080
-                  },
-                  "initialDelaySeconds": 15,
-                  "periodSeconds": 30
-                },
-                "volumeMounts": [
-                  {
-                    "name": "letsencrypt",
-                    "mountPath": "/etc/letsencrypt"
-                  },
-                  {
-                    "name": "acme",
-                    "mountPath": "/var/acme"
-                  },
-                  {
-                    "name": "tls",
-                    "mountPath": "/tls"
-                  },
-                  {
-                    "name": "scripts",
-                    "mountPath": "/scripts",
-                    "readOnly": true
-                  }
-                ]
-              }
-            ],
-            "volumes": [
-              {
-                "name": "tls",
-                "emptyDir": {}
-              },
-              {
-                "name": "acme",
-                "emptyDir": {}
-              },
-              {
-                "name": "scripts",
-                "configMap": {
-                  "name": "wsrouter-certbot"
-                }
-              }
-            ]
-          }
-        },
-        "volumeClaimTemplates": [
-          {
-            "metadata": {
-              "name": "letsencrypt"
-            },
-            "spec": {
-              "accessModes": [
-                "ReadWriteOnce"
-              ],
-              "storageClassName": "standard-rwo",
-              "resources": {
-                "requests": {
-                  "storage": "1Gi"
-                }
-              }
-            }
-          }
-        ]
-      }
-    }
-  ]
-}
+apiVersion: v1
+kind: List
+items:
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: wsrouter-0
+    namespace: wsrouter
+    labels:
+      app.kubernetes.io/name: wsrouter
+      wsrouter-shard: wsrouter-0
+    annotations:
+      cloud.google.com/l4-rbs: enabled
+  spec:
+    type: LoadBalancer
+    loadBalancerIP: 34.118.100.7
+    externalTrafficPolicy: Cluster
+    publishNotReadyAddresses: true
+    selector:
+      app.kubernetes.io/name: wsrouter
+      wsrouter-shard: wsrouter-0
+    ports:
+    - name: https
+      port: 443
+      targetPort: 443
+    - name: http-acme
+      port: 80
+      targetPort: 8080
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: wsrouter-0-internal
+    namespace: wsrouter
+    labels:
+      app.kubernetes.io/name: wsrouter
+      wsrouter-shard: wsrouter-0
+  spec:
+    clusterIP: None
+    selector:
+      app.kubernetes.io/name: wsrouter
+      wsrouter-shard: wsrouter-0
+    ports:
+    - name: https
+      port: 443
+      targetPort: 443
+- apiVersion: apps/v1
+  kind: StatefulSet
+  metadata:
+    name: wsrouter-0
+    namespace: wsrouter
+    labels:
+      app.kubernetes.io/name: wsrouter
+      wsrouter-shard: wsrouter-0
+  spec:
+    replicas: 1
+    serviceName: wsrouter-0-internal
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: wsrouter
+        wsrouter-shard: wsrouter-0
+    template:
+      metadata:
+        labels:
+          app.kubernetes.io/name: wsrouter
+          wsrouter-shard: wsrouter-0
+      spec:
+        automountServiceAccountToken: false
+        terminationGracePeriodSeconds: 30
+        nodeSelector:
+          cloud.google.com/gke-nodepool: servers-e2-standard
+        securityContext:
+          runAsUser: 65532
+          runAsGroup: 65532
+          fsGroup: 65532
+          fsGroupChangePolicy: OnRootMismatch
+          seccompProfile:
+            type: RuntimeDefault
+        containers:
+        - name: router
+          image: europe-central2-docker.pkg.dev/sukhiba-e4413/apps/wsrouter@sha256:ccafbd5727dd8b18698f5b3cbb298e85e5d4bce4d7e259ed38c0cabe40cced51
+          imagePullPolicy: IfNotPresent
+          command:
+          - /bin/sh
+          - -ec
+          args:
+          - until [ -r /tls/current/server.pem ] && [ -r /tls/current/server.key ];
+            do sleep 5; done; exec "$@"
+          - router
+          - /usr/local/bin/wsrouter
+          - --addr=https://0.nl.chatapp.world
+          - --id=0
+          - --ssl_certs=/tls/current
+          ports:
+          - name: https
+            containerPort: 443
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: '2'
+              memory: 1Gi
+          securityContext:
+            runAsUser: 65532
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+              - ALL
+              add:
+              - NET_BIND_SERVICE
+          readinessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /health
+              port: 443
+            periodSeconds: 5
+          volumeMounts:
+          - name: tls
+            mountPath: /tls
+            readOnly: true
+        - name: certbot
+          image: certbot/certbot@sha256:f70ad0adbb7e117f0fe42a63c553f28ea451edabc0148757b6efcd9735acaa20
+          command:
+          - python
+          - -u
+          - /scripts/certbot-runner.py
+          env:
+          - name: DOMAIN
+            value: 0.nl.chatapp.world
+          - name: EXPECTED_IP
+            value: 34.118.100.7
+          ports:
+          - name: http-acme
+            containerPort: 8080
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          volumeMounts:
+          - name: letsencrypt
+            mountPath: /etc/letsencrypt
+          - name: acme
+            mountPath: /var/acme
+          - name: tls
+            mountPath: /tls
+          - name: scripts
+            mountPath: /scripts
+            readOnly: true
+        volumes:
+        - name: tls
+          emptyDir: {}
+        - name: acme
+          emptyDir: {}
+        - name: scripts
+          configMap:
+            name: wsrouter-certbot
+    volumeClaimTemplates:
+    - metadata:
+        name: letsencrypt
+      spec:
+        accessModes:
+        - ReadWriteOnce
+        storageClassName: standard-rwo
+        resources:
+          requests:
+            storage: 1Gi

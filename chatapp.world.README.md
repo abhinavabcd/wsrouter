@@ -14,8 +14,9 @@ The cluster is in Poland (`europe-central2`); `nl` in the hostname is only a nam
 | StatefulSet / pod | `wsrouter-0` / `wsrouter-0-0` |
 | Service ClusterIP | `10.112.15.40` |
 | Certificate PVC | `letsencrypt-wsrouter-0-0` (1 GiB) |
-| Image tag | `europe-central2-docker.pkg.dev/sukhiba-e4413/apps/wsrouter:20261019-tls-auto` |
-| Deployed digest | `sha256:7a9a36d235772ad3697b701a1eb49d20a0047ee708db1266f09169d77412f113` |
+| Image tag | `europe-central2-docker.pkg.dev/sukhiba-e4413/apps/wsrouter:20261022-go1.27.3` |
+| Go builder | `golang:1.27.3-alpine3.24` |
+| Deployed digest | `sha256:ccafbd5727dd8b18698f5b3cbb298e85e5d4bce4d7e259ed38c0cabe40cced51` |
 
 Run the commands below from this directory, using the context above.
 
@@ -76,19 +77,25 @@ kubectl -n wsrouter create configmap wsrouter-certbot \
 kubectl apply -f deploy/certbot-configmap.yaml -f deploy/chatworld-nl-0.yaml
 ```
 
-For a new router build, use a new tag and capture the digest printed by push:
+Deploy the current source with the production script:
 
 ```sh
-IMAGE=europe-central2-docker.pkg.dev/sukhiba-e4413/apps/wsrouter:YOUR_NEW_TAG
-docker build -t "$IMAGE" .
-docker push "$IMAGE"
-python3 deploy/render-shard.py --name wsrouter-0 \
-  --domain 0.nl.chatapp.world --ring-id 0 --ip 34.118.100.7 \
-  --image europe-central2-docker.pkg.dev/sukhiba-e4413/apps/wsrouter@sha256:YOUR_DIGEST \
-  > deploy/chatworld-nl-0.yaml
-kubectl apply -f deploy/chatworld-nl-0.yaml
-kubectl -n wsrouter rollout status statefulset/wsrouter-0
+./prod_deploy.sh
+# Or use an explicit image tag:
+./prod_deploy.sh 20261022-router-update
 ```
+
+The script reads the Go builder image from `Dockerfile`, runs race tests,
+`go vet`, and the five-server/1,000-node stress test, builds and pushes the image,
+then deploys its immutable digest. It targets the production context explicitly,
+waits for readiness and checks public HTTPS health. After success it updates the
+local manifest and the image table above. It prints the previous image and a
+rollback command before changing production. A failed check stops the script.
+The script updates only the router image; apply infrastructure changes separately.
+
+`RUN_STRESS=0 ./prod_deploy.sh` skips the stress test. `KUBE_CONTEXT` overrides the
+default production context when needed. Docker registry credentials, kubectl
+access, Docker, curl and Python 3 must already be available.
 
 An image update replaces the pod and clients must reconnect. A certificate
 renewal alone does not replace the pod. To activate changes to the Python
@@ -116,7 +123,7 @@ SHARD_IP=$(gcloud compute addresses describe wsrouter-1-nl \
 python3 deploy/render-shard.py --name wsrouter-1 \
   --domain 1.nl.chatapp.world --ring-id 4611686018427387904 --ip "$SHARD_IP" \
   --clusteraddr https://0.nl.chatapp.world \
-  --image europe-central2-docker.pkg.dev/sukhiba-e4413/apps/wsrouter@sha256:7a9a36d235772ad3697b701a1eb49d20a0047ee708db1266f09169d77412f113 \
+  --image europe-central2-docker.pkg.dev/sukhiba-e4413/apps/wsrouter@sha256:ccafbd5727dd8b18698f5b3cbb298e85e5d4bce4d7e259ed38c0cabe40cced51 \
   > deploy/wsrouter-1.json
 kubectl apply -f deploy/wsrouter-1.json
 ```

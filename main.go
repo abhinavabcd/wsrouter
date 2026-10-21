@@ -401,6 +401,7 @@ func (s *server) routes() http.Handler {
 	handle("GET /locate", s.locate)
 	handle("GET /peer", s.peer)
 	handle("POST /refresh", s.refresh)
+	handle("GET /snapshot", s.viewSnapshot)
 	handle("POST /snapshot", s.receiveSnapshot)
 	handle("POST /reload", s.reload)
 	mux.HandleFunc("GET /health", s.health)
@@ -767,6 +768,27 @@ func (s *server) refreshOnce(ctx context.Context) error {
 	}
 	s.applySnapshot(state.Peers, state.Epoch, state.Version)
 	return nil
+}
+
+func (s *server) viewSnapshot(w http.ResponseWriter, r *http.Request) error {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil || host != "127.0.0.1" {
+		return httpStatus(http.StatusUnauthorized)
+	}
+	s.mu.RLock()
+	peers := append([]peer(nil), s.ring...)
+	s.mu.RUnlock()
+	var text strings.Builder
+	text.WriteString("addr\tnodes\tringid\n")
+	for _, p := range peers {
+		if p.ID == s.id {
+			p.Nodes = s.nodeCount.Load()
+		}
+		fmt.Fprintf(&text, "%s\t%d\t%d\n", p.Addr, p.Nodes, p.ID)
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, err = io.WriteString(w, text.String())
+	return err
 }
 
 func (s *server) snapshotLocked() []peer {
