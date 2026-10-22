@@ -87,9 +87,10 @@ type receiptQueue struct {
 }
 
 type nodeState struct {
-	mu          sync.Mutex
-	connections map[*client]struct{}
-	recent      receiptQueue
+	nextConnection uint64
+	mu             sync.Mutex
+	connections    map[*client]struct{}
+	recent         receiptQueue
 }
 
 type outbound struct {
@@ -103,23 +104,24 @@ type routedPacket struct {
 }
 
 type client struct {
-	conn         *websocket.Conn
-	nodeID       string
-	xSrcID       string
-	nodeType     string
-	keepAlive    time.Duration
-	rp5          int64
-	rateBucket   int64 // readLoop owns the per-connection bucket and counter
-	rateCount    int64
-	sent         []replayRecord // guarded by state.mu
-	sentHead     int
-	normalClose  atomic.Bool
-	send         chan outbound
-	done         chan struct{}
-	once         sync.Once
-	pendingBytes atomic.Int64
-	server       *server
-	state        *nodeState
+	connectionOrder uint64
+	conn            *websocket.Conn
+	nodeID          string
+	xSrcID          string
+	nodeType        string
+	keepAlive       time.Duration
+	rp5             int64
+	rateBucket      int64 // readLoop owns the per-connection bucket and counter
+	rateCount       int64
+	sent            []replayRecord // guarded by state.mu
+	sentHead        int
+	normalClose     atomic.Bool
+	send            chan outbound
+	done            chan struct{}
+	once            sync.Once
+	pendingBytes    atomic.Int64
+	server          *server
+	state           *nodeState
 }
 
 type server struct {
@@ -541,6 +543,7 @@ func (s *server) connect(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 	cl := &client{conn: conn, nodeID: c.NodeID, xSrcID: c.XSrcID, nodeType: c.NodeType, rp5: c.RP5, keepAlive: keepAlive, send: make(chan outbound, 4096), done: make(chan struct{}), server: s}
+	var evicted []*client
 	s.mu.Lock()
 	state := s.nodes[c.NodeID]
 	if state == nil {
@@ -549,10 +552,26 @@ func (s *server) connect(w http.ResponseWriter, r *http.Request) error {
 		s.nodeCount.Add(1)
 	}
 	state.mu.Lock()
+	for len(state.connections) >= c.MaxC {
+		var oldest *client
+		for existing := range state.connections {
+			if oldest == nil || existing.connectionOrder < oldest.connectionOrder {
+				oldest = existing
+			}
+		}
+		oldest.normalClose.Store(true)
+		delete(state.connections, oldest)
+		evicted = append(evicted, oldest)
+	}
+	state.nextConnection++
+	cl.connectionOrder = state.nextConnection
 	state.connections[cl] = struct{}{}
 	cl.state = state
 	state.mu.Unlock()
 	s.mu.Unlock()
+	for _, old := range evicted {
+		old.close()
+	}
 	go cl.writeLoop()
 	if now, ok := s.owner(c.NodeID); ok && now.Addr != s.addr {
 		cl.reconnect(now.Addr)
@@ -1311,6 +1330,7 @@ type domainIdentity struct {
 	XSrcID   string `json:"x_src_id"`
 	NodeType string `json:"node_type"`
 	RP5      int64  `json:"rp5"`
+	MaxC     int    `json:"maxc"`
 	Expires  int64  `json:"expires,omitempty"`
 }
 
@@ -1404,7 +1424,7 @@ func requestIdentity(r *http.Request) (string, string) {
 }
 
 func (s *server) authenticate(ctx context.Context, nodeID, token, action, origin string) (domainIdentity, error) {
-	c := domainIdentity{NodeID: nodeID, Token: token, XSrcID: nodeID, NodeType: "node", RP5: 10}
+	c := domainIdentity{NodeID: nodeID, Token: token, XSrcID: nodeID, NodeType: "node", RP5: 10, MaxC: 5}
 	u, secret, err := authEndpoint(nodeID, token)
 	if err != nil {
 		return c, err
@@ -1443,16 +1463,19 @@ func (s *server) authenticate(ctx context.Context, nodeID, token, action, origin
 			Valid   json.RawMessage `json:"valid"`
 			XSrcID  string          `json:"x_src_id"`
 			RP5     int64           `json:"rp5"`
+			MaxC    int             `json:"maxc"`
 			Expires int64           `json:"expires"`
 			Secret  string          `json:"secret_string"`
 		}
-		if json.Unmarshal(body, &approval) != nil || (string(approval.Valid) != `"true"` && string(approval.Valid) != "true") || approval.RP5 <= 0 || len(approval.XSrcID) > 256 || approval.Expires < 0 || (approval.Expires != 0 && approval.Expires <= time.Now().Unix()) {
+		approval.MaxC = 5
+		if json.Unmarshal(body, &approval) != nil || (string(approval.Valid) != `"true"` && string(approval.Valid) != "true") || approval.RP5 <= 0 || approval.MaxC <= 0 || len(approval.XSrcID) > 256 || approval.Expires < 0 || (approval.Expires != 0 && approval.Expires <= time.Now().Unix()) {
 			return c, errors.New("authorization denied")
 		}
 		if approval.XSrcID != "" {
 			c.XSrcID = approval.XSrcID
 		}
 		c.RP5 = approval.RP5
+		c.MaxC = approval.MaxC
 		c.Expires = approval.Expires
 		if action == "renew" && approval.Secret != "" {
 			path, _, _ := strings.Cut(token, "|")

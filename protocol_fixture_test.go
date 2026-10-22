@@ -34,6 +34,7 @@ var fixtureTokens sync.Map   // token -> node ID, used by existing routing helpe
 var fixtureAccounts sync.Map // secret -> *fixtureAccount
 
 type fixtureAccount struct {
+	maxc                    int
 	mu                      sync.Mutex
 	nodeID, source, rotated string
 	rate                    int64
@@ -99,6 +100,9 @@ func TestMain(m *testing.M) {
 			return
 		}
 		approval := map[string]any{"valid": "true", "rp5": account.rate, "x_src_id": account.source, "expires": account.expires}
+		if account.maxc != 0 {
+			approval["maxc"] = account.maxc
+		}
 		if r.URL.Query().Get("action") == "renew" {
 			account.renewCalls++
 			if account.denyRenew {

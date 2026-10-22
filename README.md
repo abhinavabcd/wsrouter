@@ -42,10 +42,10 @@ Content-Type: application/json
 The verifier must return HTTP 200 with JSON:
 
 ```json
-{"valid":"true","rp5":10}
+{"valid":"true","rp5":10,"maxc":5}
 ```
 
-Boolean `true` is also accepted. `rp5` is required and must be a positive integer. Plain `ok`, false/missing validity, invalid rates, redirects, certificate failures, and timeouts deny authentication. Verification has a five-second timeout and an 8 KiB response limit. The `node_id` query parameter always comes from the requested identity, replacing any existing values. Other query parameters are preserved, except `action`, which is controlled by the router.
+Boolean `true` is also accepted. `maxc` is an optional positive integer, defaulting to 5, that limits tracked `/connect` sockets per node. A new connection evicts and closes the oldest tracked socket when the limit is reached. A lowered limit evicts as many oldest sockets as needed before tracking the new one. Eviction is an intentional close and does not replay recent packets. `rp5` is required and must be a positive integer. Plain `ok`, false/missing validity, invalid rates, redirects, certificate failures, and timeouts deny authentication. Verification has a five-second timeout and an 8 KiB response limit. The `node_id` query parameter always comes from the requested identity, replacing any existing values. Other query parameters are preserved, except `action`, which is controlled by the router.
 
 The verifier can additionally return `x_src_id` and `expires` (Unix seconds). Without them, `x_src_id` defaults to the node ID and validity is decided by the authority on each authentication. A returned expiry must be in the future. `/create` no longer accepts trusted identity, rate, or lifetime claims from the caller: the authority supplies them. Old HMAC tokens are incompatible with this protocol.
 
