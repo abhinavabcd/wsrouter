@@ -9,8 +9,8 @@ import (
 )
 
 func TestPeerFeedbackDoesNotBlockRouting(t *testing.T) {
-	link := &peerLink{done: make(chan struct{}), send: make(chan []byte, 1), feedbackReady: make(chan struct{}, 1)}
-	link.send <- []byte("full data queue")
+	link := &peerLink{done: make(chan struct{}), ready: make(chan struct{}, 1)}
+	link.data.bytes = 64 << 20 // Data is full; feedback must still make progress.
 	done := make(chan error, 1)
 	go func() {
 		for i := range 20000 {
@@ -32,14 +32,14 @@ func TestPeerFeedbackDoesNotBlockRouting(t *testing.T) {
 	}
 	for i := range 20000 {
 		var frame peerFrame
-		if err := json.Unmarshal(link.takeFeedback(), &frame); err != nil || frame.Packet.PacketID != strconv.Itoa(i) {
+		if err := json.Unmarshal(link.takeFrame(false), &frame); err != nil || frame.Packet.PacketID != strconv.Itoa(i) {
 			t.Fatalf("feedback %d was reordered or lost: %v", i, err)
 		}
 	}
-	if link.takeFeedback() != nil || link.feedbackBytes != 0 || len(link.feedback) != 0 {
+	if link.takeFrame(false) != nil || link.feedback.bytes != 0 || len(link.feedback.entries) != 0 {
 		t.Fatal("drained feedback queue retained messages or accounting")
 	}
-	link.feedbackBytes = 64 << 20
+	link.feedback.bytes = 64 << 20
 	if err := link.enqueue(context.Background(), packet{Type: "status"}); err == nil {
 		t.Fatal("feedback exceeded its memory limit")
 	}

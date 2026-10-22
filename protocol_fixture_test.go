@@ -138,6 +138,7 @@ func startTestRouter(t *testing.T, id uint64, cluster string) (*server, *httptes
 	ts.StartTLS()
 	ts.URL = address
 	t.Cleanup(func() {
+		close(s.routingDone)
 		s.peerMu.Lock()
 		links := make([]*peerLink, 0, len(s.allPeerLinks))
 		for link := range s.allPeerLinks {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -21,6 +22,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -64,7 +66,7 @@ type packet struct {
 	replays   uint8
 }
 type replayRecord struct {
-	packet packet
+	packet *packet
 	sentAt time.Time
 }
 
@@ -99,11 +101,15 @@ type outbound struct {
 }
 
 type routedPacket struct {
+	client *client
 	packet packet
 	bytes  int
 }
 
 type client struct {
+	pingIndex       int // guarded by server.pingMu
+	nextPing        time.Time
+	ping            chan struct{}
 	connectionOrder uint64
 	conn            *websocket.Conn
 	nodeID          string
@@ -119,6 +125,7 @@ type client struct {
 	send            chan outbound
 	done            chan struct{}
 	once            sync.Once
+	queuedBytes     atomic.Int64
 	pendingBytes    atomic.Int64
 	server          *server
 	state           *nodeState
@@ -138,12 +145,13 @@ type server struct {
 	certificate  atomic.Pointer[tls.Certificate]
 
 	refreshMu     sync.Mutex
-	peerDialMu    sync.Mutex
-	peerMu        sync.Mutex
+	peerDials     sync.Map // peer ID -> *sync.Mutex; only used when establishing a link
+	peerMu        sync.RWMutex
 	peerLinks     map[uint64]*peerLink
 	allPeerLinks  map[*peerLink]struct{}
 	mu            sync.RWMutex
 	ring          []peer
+	routingRing   atomic.Value // immutable []peer, published with membership updates
 	ringEpoch     int64
 	ringVersion   uint64
 	epoch         int64
@@ -155,6 +163,13 @@ type server struct {
 	packetPrefix  string
 	nextPacketID  atomic.Uint64
 	statusErrors  atomic.Uint64
+	pingMu        sync.Mutex
+	pings         pingHeap
+	pingWake      chan struct{}
+	routingOnce   sync.Once
+	routingDone   chan struct{}
+	routingQueues []chan *routedPacket
+	routingBytes  atomic.Int64
 	routeErrors   atomic.Uint64
 	nodeCount     atomic.Int64
 }
@@ -165,21 +180,55 @@ type peerFrame struct {
 	Replays uint8  `json:"replays,omitempty"`
 }
 
+type frameQueue struct {
+	entries [][]byte
+	head    int
+	bytes   int
+}
+
+func (q *frameQueue) push(data []byte) bool {
+	if q.bytes+len(data) > 64<<20 {
+		return false
+	}
+	q.entries = append(q.entries, data)
+	q.bytes += len(data)
+	return true
+}
+
+func (q *frameQueue) pop() []byte {
+	if q.head == len(q.entries) {
+		return nil
+	}
+	data := q.entries[q.head]
+	q.entries[q.head] = nil
+	q.head++
+	q.bytes -= len(data)
+	if q.head == len(q.entries) {
+		q.entries, q.head = q.entries[:0], 0
+		if cap(q.entries) > 4096 {
+			q.entries = nil
+		}
+	} else if q.head > 1024 && q.head*2 >= len(q.entries) {
+		n := copy(q.entries, q.entries[q.head:])
+		clear(q.entries[n:])
+		q.entries, q.head = q.entries[:n], 0
+	}
+	return data
+}
+
 type peerLink struct {
-	server        *server
-	peerID        uint64
-	conn          *websocket.Conn
-	send          chan []byte
-	incoming      chan packet
-	done          chan struct{}
-	once          sync.Once
-	mu            sync.Mutex
-	history       []replayRecord
-	head          int
-	feedback      [][]byte // guarded by mu; never block routing on feedback
-	feedbackHead  int
-	feedbackBytes int
-	feedbackReady chan struct{}
+	batch    bool
+	server   *server
+	peerID   uint64
+	conn     *websocket.Conn
+	done     chan struct{}
+	once     sync.Once
+	mu       sync.Mutex
+	history  []replayRecord
+	head     int
+	data     frameQueue // both queues and history are guarded by mu
+	feedback frameQueue
+	ready    chan struct{}
 }
 
 func main() {
@@ -259,6 +308,8 @@ func newServer(id uint64, addr, clusterAddr string) *server {
 		httpClient:   &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }, Transport: &http.Transport{MaxIdleConns: 1024, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second}},
 		upgrader:     websocket.Upgrader{ReadBufferSize: 4096, WriteBufferSize: 4096, CheckOrigin: func(*http.Request) bool { return true }},
 		keepAlive:    30 * time.Second,
+		routingDone:  make(chan struct{}),
+		pingWake:     make(chan struct{}, 1),
 		members:      make(map[uint64]member),
 		peerLinks:    make(map[uint64]*peerLink),
 		allPeerLinks: make(map[*peerLink]struct{}),
@@ -279,6 +330,7 @@ func newServer(id uint64, addr, clusterAddr string) *server {
 		s.ringVersion = 1
 		s.version = 1
 	}
+	s.routingRing.Store(s.ring)
 	return s
 }
 
@@ -542,7 +594,7 @@ func (s *server) connect(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return nil
 	}
-	cl := &client{conn: conn, nodeID: c.NodeID, xSrcID: c.XSrcID, nodeType: c.NodeType, rp5: c.RP5, keepAlive: keepAlive, send: make(chan outbound, 4096), done: make(chan struct{}), server: s}
+	cl := &client{pingIndex: -1, ping: make(chan struct{}, 1), conn: conn, nodeID: c.NodeID, xSrcID: c.XSrcID, nodeType: c.NodeType, rp5: c.RP5, keepAlive: keepAlive, send: make(chan outbound, 1024), done: make(chan struct{}), server: s}
 	var evicted []*client
 	s.mu.Lock()
 	state := s.nodes[c.NodeID]
@@ -571,6 +623,19 @@ func (s *server) connect(w http.ResponseWriter, r *http.Request) error {
 	s.mu.Unlock()
 	for _, old := range evicted {
 		old.close()
+	}
+	s.startRouting()
+	s.pingMu.Lock()
+	select {
+	case <-cl.done:
+	default:
+		cl.nextPing = time.Now().Add(cl.keepAlive)
+		heap.Push(&s.pings, cl)
+	}
+	s.pingMu.Unlock()
+	select {
+	case s.pingWake <- struct{}{}:
+	default:
 	}
 	go cl.writeLoop()
 	if now, ok := s.owner(c.NodeID); ok && now.Addr != s.addr {
@@ -825,6 +890,7 @@ func (s *server) snapshotLocked() []peer {
 }
 
 func (s *server) applySnapshot(snapshot []peer, epoch int64, version uint64) bool {
+	snapshot = append([]peer(nil), snapshot...)
 	sort.Slice(snapshot, func(i, j int) bool { return snapshot[i].ID < snapshot[j].ID })
 	s.mu.Lock()
 	if epoch < s.ringEpoch || (epoch == s.ringEpoch && version <= s.ringVersion) {
@@ -843,6 +909,7 @@ func (s *server) applySnapshot(snapshot []peer, epoch int64, version uint64) boo
 		}
 	}
 	s.ring = snapshot
+	s.routingRing.Store(snapshot)
 	var moved []struct {
 		cl   *client
 		addr string
@@ -870,12 +937,11 @@ func (s *server) applySnapshot(snapshot []peer, epoch int64, version uint64) boo
 }
 
 func (s *server) owner(nodeID string) (peer, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if len(s.ring) == 0 {
+	ring, _ := s.routingRing.Load().([]peer)
+	if len(ring) == 0 {
 		return peer{}, false
 	}
-	return ownerIn(s.ring, nodeID), true
+	return ownerIn(ring, nodeID), true
 }
 
 func ownerIn(ring []peer, nodeID string) peer {
@@ -939,6 +1005,7 @@ func (s *server) route(p packet) {
 }
 
 func (s *server) deliver(p packet, data []byte) bool {
+	now := time.Now()
 	var slow []*client
 	delivered := false
 	s.mu.RLock()
@@ -954,22 +1021,20 @@ func (s *server) deliver(p packet, data []byte) bool {
 			continue
 		default:
 		}
-		select {
-		case cl.send <- outbound{data: data}:
+		if cl.queue(outbound{data: data}) {
 			delivered = true
 			if p.replays < 3 {
-				cl.sent, cl.sentHead = pruneHistory(cl.sent, cl.sentHead, time.Now().Add(-cl.keepAlive))
+				cl.sent, cl.sentHead = pruneHistory(cl.sent, cl.sentHead, now.Add(-cl.keepAlive))
 				if len(cl.sent) == 0 {
 					s.recentClients.Store(cl, struct{}{})
 				}
-				cl.sent = append(cl.sent, replayRecord{packet: p, sentAt: time.Now()})
+				cl.sent = append(cl.sent, replayRecord{packet: &p, sentAt: now})
 			}
-		default:
+		} else {
 			slow = append(slow, cl)
 		}
 	}
 	if delivered && p.Type != "status" {
-		now := time.Now()
 		q := &state.recent
 		q.prune(now)
 		first := len(q.entries) == 0
@@ -999,6 +1064,7 @@ func (s *server) sendStatus(p packet, delivered bool) {
 func (q *receiptQueue) prune(now time.Time) {
 	cutoff := now.Add(-10 * time.Second)
 	for q.head < len(q.entries) && q.entries[q.head].sentAt.Before(cutoff) {
+		q.entries[q.head] = receipt{}
 		q.head++
 	}
 	if q.head == len(q.entries) {
@@ -1007,8 +1073,9 @@ func (q *receiptQueue) prune(now time.Time) {
 		return
 	}
 	if q.head > 1024 && q.head*2 >= len(q.entries) {
-		q.entries = append([]receipt(nil), q.entries[q.head:]...)
-		q.head = 0
+		n := copy(q.entries, q.entries[q.head:])
+		clear(q.entries[n:])
+		q.entries, q.head = q.entries[:n], 0
 	}
 }
 
@@ -1051,9 +1118,6 @@ func (s *server) receiptCleanupLoop(ctx context.Context) {
 
 func (cl *client) readLoop() {
 	defer cl.close()
-	jobs := make(chan routedPacket, 1024)
-	defer close(jobs)
-	go cl.routeLoop(jobs)
 	cl.conn.SetReadLimit(1 << 20)
 	cl.conn.SetReadDeadline(time.Now().Add(cl.keepAlive + 10*time.Second))
 	cl.conn.SetPongHandler(func(string) error {
@@ -1101,16 +1165,16 @@ func (cl *client) readLoop() {
 			cl.drop(p, data, reason)
 			continue
 		}
-		size := int64(len(data))
-		if cl.pendingBytes.Add(size) > 4<<20 {
-			cl.pendingBytes.Add(-size)
-			return
+		dests := p.Dests
+		if len(dests) == 0 {
+			dests = []string{p.Dest}
 		}
-		select {
-		case jobs <- routedPacket{packet: p, bytes: len(data)}:
-		default:
-			cl.pendingBytes.Add(-size)
-			return
+		p.Dests = nil
+		for _, dest := range dests {
+			p.Dest = dest
+			if !cl.server.submit(p, cl) {
+				return
+			}
 		}
 	}
 }
@@ -1144,31 +1208,126 @@ func (cl *client) drop(p packet, original []byte, reason string) {
 	cl.enqueue(outbound{data: data})
 }
 
-func (cl *client) routeLoop(jobs <-chan routedPacket) {
-	for job := range jobs {
-		cl.pendingBytes.Add(-int64(job.bytes))
-		dests := job.packet.Dests
-		if len(dests) == 0 {
-			dests = []string{job.packet.Dest}
+// A bounded set of workers groups destination-node routing without pinning OS threads.
+// Connection lifecycle operations retain their locks; workers never own socket I/O.
+func (s *server) startRouting() {
+	s.routingOnce.Do(func() {
+		go s.heartbeatLoop()
+		s.routingQueues = make([]chan *routedPacket, min(runtime.GOMAXPROCS(0), 8))
+		for i := range s.routingQueues {
+			q := make(chan *routedPacket, 131072)
+			s.routingQueues[i] = q
+			go func() {
+				for {
+					select {
+					case <-s.routingDone:
+						return
+					case job := <-q:
+						s.routingBytes.Add(-int64(job.bytes))
+						if job.client != nil {
+							job.client.pendingBytes.Add(-int64(job.bytes))
+						}
+						s.route(job.packet)
+					}
+				}
+			}()
 		}
-		for _, dest := range dests {
-			p := job.packet
-			p.Dest = dest
-			p.Dests = nil
-			cl.server.route(p)
+	})
+}
+
+func (s *server) submit(p packet, source *client) bool {
+	s.startRouting()
+	// Count the expanded destination's retained fields, not the entire fanout list.
+	size := int64(len(p.Payload) + len(p.Dest) + len(p.Src) + len(p.SrcNodeID) + len(p.XSrc) + len(p.PacketID) + len(p.Type) + 160)
+	if source != nil && source.pendingBytes.Add(size) > 4<<20 {
+		source.pendingBytes.Add(-size)
+		return false
+	}
+	if s.routingBytes.Add(size) <= 128<<20 {
+		hash := sha256.Sum256([]byte(p.Dest))
+		q := s.routingQueues[binary.BigEndian.Uint64(hash[:8])%uint64(len(s.routingQueues))]
+		select {
+		case <-s.routingDone:
+		case q <- &routedPacket{packet: p, bytes: int(size), client: source}:
+			return true
+		default:
+		}
+	}
+	s.routingBytes.Add(-size)
+	if source != nil {
+		source.pendingBytes.Add(-size)
+	}
+	return false
+}
+
+// One timer per server schedules all client pings. Socket writes stay in writeLoop.
+type pingHeap []*client
+
+func (h pingHeap) Len() int           { return len(h) }
+func (h pingHeap) Less(i, j int) bool { return h[i].nextPing.Before(h[j].nextPing) }
+func (h pingHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].pingIndex = i
+	h[j].pingIndex = j
+}
+func (h *pingHeap) Push(value any) {
+	cl := value.(*client)
+	cl.pingIndex = len(*h)
+	*h = append(*h, cl)
+}
+func (h *pingHeap) Pop() any {
+	last := len(*h) - 1
+	cl := (*h)[last]
+	(*h)[last] = nil
+	*h = (*h)[:last]
+	cl.pingIndex = -1
+	return cl
+}
+
+func (s *server) heartbeatLoop() {
+	timer := time.NewTimer(time.Hour)
+	defer timer.Stop()
+	for {
+		now := time.Now()
+		wait := time.Hour
+		s.pingMu.Lock()
+		for len(s.pings) != 0 && !s.pings[0].nextPing.After(now) {
+			cl := s.pings[0]
+			cl.nextPing = now.Add(cl.keepAlive)
+			heap.Fix(&s.pings, 0)
+			select {
+			case cl.ping <- struct{}{}:
+			default:
+			}
+		}
+		if len(s.pings) != 0 {
+			wait = time.Until(s.pings[0].nextPing)
+		}
+		s.pingMu.Unlock()
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(wait)
+		select {
+		case <-s.routingDone:
+			return
+		case <-s.pingWake:
+		case <-timer.C:
 		}
 	}
 }
 
 func (cl *client) writeLoop() {
-	ticker := time.NewTicker(cl.keepAlive)
-	defer ticker.Stop()
 	defer cl.close()
 	for {
 		select {
 		case <-cl.done:
 			return
 		case msg := <-cl.send:
+			cl.queuedBytes.Add(-int64(len(msg.data)))
 			cl.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := cl.conn.WriteMessage(websocket.TextMessage, msg.data); err != nil {
 				return
@@ -1176,7 +1335,7 @@ func (cl *client) writeLoop() {
 			if msg.closeAfter {
 				return
 			}
-		case <-ticker.C:
+		case <-cl.ping:
 			cl.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := cl.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
@@ -1185,11 +1344,22 @@ func (cl *client) writeLoop() {
 	}
 }
 
+func (cl *client) queue(msg outbound) bool {
+	size := int64(len(msg.data))
+	if cl.queuedBytes.Add(size) <= 4<<20 {
+		select {
+		case <-cl.done:
+		case cl.send <- msg:
+			return true
+		default:
+		}
+	}
+	cl.queuedBytes.Add(-size)
+	return false
+}
+
 func (cl *client) enqueue(msg outbound) {
-	select {
-	case <-cl.done:
-	case cl.send <- msg:
-	default:
+	if !cl.queue(msg) {
 		cl.close()
 	}
 }
@@ -1205,6 +1375,11 @@ func (cl *client) close() {
 		close(cl.done)
 		cl.conn.Close()
 		s := cl.server
+		s.pingMu.Lock()
+		if cl.pingIndex >= 0 {
+			heap.Remove(&s.pings, cl.pingIndex)
+		}
+		s.pingMu.Unlock()
 		var recent []receipt
 		var replay []replayRecord
 		s.mu.Lock()
@@ -1224,7 +1399,7 @@ func (cl *client) close() {
 				s.nodeCount.Add(-1)
 			}
 			state.recent.prune(time.Now())
-			recent = state.recent.entries[state.recent.head:]
+			recent = append([]receipt(nil), state.recent.entries[state.recent.head:]...)
 			s.recent.CompareAndDelete(cl.nodeID, state)
 		}
 		state.mu.Unlock()
@@ -1235,7 +1410,7 @@ func (cl *client) close() {
 			retried = make(map[[2]string]struct{}, len(replay))
 		}
 		for _, item := range replay {
-			p := item.packet
+			p := *item.packet
 			if retried != nil {
 				retried[[2]string{p.sourceNodeID(), p.PacketID}] = struct{}{}
 			}
@@ -1499,30 +1674,49 @@ func (s *server) peer(w http.ResponseWriter, r *http.Request) error {
 	if err := s.verifyServerNode(r, id); err != nil {
 		return err
 	}
-	conn, err := s.upgrader.Upgrade(w, r, nil)
+	batch := r.Header.Get("X-Peer-Batching") == "1"
+	response := http.Header{}
+	if batch {
+		response.Set("X-Peer-Batching", "1")
+	}
+	conn, err := s.upgrader.Upgrade(w, r, response)
 	if err != nil {
 		return nil
 	}
-	s.addPeerLink(id, conn)
+	s.addPeerLink(id, conn, batch)
 	return nil
 }
 
 func (s *server) getPeerLink(owner peer) (*peerLink, error) {
-	s.peerDialMu.Lock()
-	defer s.peerDialMu.Unlock()
-	s.peerMu.Lock()
+	s.peerMu.RLock()
 	if link := s.peerLinks[owner.ID]; link != nil {
 		select {
 		case <-link.done:
 		default:
-			s.peerMu.Unlock()
+			s.peerMu.RUnlock()
 			return link, nil
 		}
 	}
-	s.peerMu.Unlock()
+	s.peerMu.RUnlock()
+	dial, _ := s.peerDials.LoadOrStore(owner.ID, &sync.Mutex{})
+	lock := dial.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+	// Another request may have established this peer while we waited.
+	s.peerMu.RLock()
+	if link := s.peerLinks[owner.ID]; link != nil {
+		select {
+		case <-link.done:
+		default:
+			s.peerMu.RUnlock()
+			return link, nil
+		}
+	}
+	s.peerMu.RUnlock()
 	address := "ws" + strings.TrimPrefix(owner.Addr, "http") + "/peer"
 	headers := http.Header{}
 	headers.Set("X-Server-ID", strconv.FormatUint(s.id, 10))
+	headers.Set("X-Peer-Batching", "1")
 	headers.Set("X-Node-ID", s.serverNodeID)
 	s.mu.RLock()
 	token := s.serverToken
@@ -1540,11 +1734,11 @@ func (s *server) getPeerLink(owner peer) (*peerLink, error) {
 		}
 		return nil, err
 	}
-	return s.addPeerLink(owner.ID, conn), nil
+	return s.addPeerLink(owner.ID, conn, resp.Header.Get("X-Peer-Batching") == "1"), nil
 }
 
-func (s *server) addPeerLink(peerID uint64, conn *websocket.Conn) *peerLink {
-	link := &peerLink{server: s, peerID: peerID, conn: conn, send: make(chan []byte, 4096), feedbackReady: make(chan struct{}, 1), incoming: make(chan packet, 4096), done: make(chan struct{})}
+func (s *server) addPeerLink(peerID uint64, conn *websocket.Conn, batch bool) *peerLink {
+	link := &peerLink{batch: batch, server: s, peerID: peerID, conn: conn, ready: make(chan struct{}, 1), done: make(chan struct{})}
 	s.peerMu.Lock()
 	old := s.peerLinks[link.peerID]
 	if old == nil {
@@ -1559,9 +1753,6 @@ func (s *server) addPeerLink(peerID uint64, conn *websocket.Conn) *peerLink {
 	s.allPeerLinks[link] = struct{}{}
 	s.peerMu.Unlock()
 	go link.writeLoop()
-	for range 16 {
-		go link.processLoop()
-	}
 	go link.readLoop()
 	return link
 }
@@ -1572,6 +1763,9 @@ func (link *peerLink) enqueue(ctx context.Context, p packet) error {
 	if len(data) > 1<<20+4096 {
 		return errors.New("peer packet too large")
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	link.mu.Lock()
 	select {
 	case <-link.done:
@@ -1579,96 +1773,86 @@ func (link *peerLink) enqueue(ctx context.Context, p packet) error {
 		return errors.New("peer link closed")
 	default:
 	}
+	queue := &link.data
 	if p.Type == "status" {
-		// Blocking here can fill both peers' routing queues and stop reads/pongs.
-		if link.feedbackBytes+len(data) > 64<<20 {
-			link.mu.Unlock()
-			return errors.New("peer feedback queue full")
-		}
-		link.recordLocked(p, time.Now())
-		link.feedback = append(link.feedback, data)
-		link.feedbackBytes += len(data)
+		queue = &link.feedback
+	}
+	if !queue.push(data) {
 		link.mu.Unlock()
-		select {
-		case link.feedbackReady <- struct{}{}:
-		default:
-		}
-		return nil
+		return errors.New("peer queue full")
 	}
 	link.recordLocked(p, time.Now())
 	link.mu.Unlock()
 	select {
-	case <-link.done:
-		return errors.New("peer link closed")
-	case <-ctx.Done():
-		return ctx.Err()
-	case link.send <- data:
-		return nil
+	case link.ready <- struct{}{}:
+	default:
 	}
-}
-
-func (link *peerLink) takeFeedback() []byte {
-	link.mu.Lock()
-	defer link.mu.Unlock()
-	if link.feedbackHead == len(link.feedback) {
-		return nil
-	}
-	data := link.feedback[link.feedbackHead]
-	link.feedback[link.feedbackHead] = nil
-	link.feedbackHead++
-	link.feedbackBytes -= len(data)
-	if link.feedbackHead == len(link.feedback) {
-		link.feedback, link.feedbackHead = nil, 0
-	} else if link.feedbackHead > 1024 && link.feedbackHead*2 >= len(link.feedback) {
-		link.feedback = append([][]byte(nil), link.feedback[link.feedbackHead:]...)
-		link.feedbackHead = 0
-	}
-	return data
+	return nil
 }
 
 func (link *peerLink) readLoop() {
 	defer link.close()
-	defer close(link.incoming)
-	link.conn.SetReadLimit(1<<20 + 4096)
+	link.conn.SetReadLimit(2<<20 + 8192)
 	link.conn.SetReadDeadline(time.Now().Add(13 * time.Second))
 	link.conn.SetPongHandler(func(string) error { return link.conn.SetReadDeadline(time.Now().Add(13 * time.Second)) })
+	var buffer bytes.Buffer
 	for {
-		kind, data, err := link.conn.ReadMessage()
+		kind, reader, err := link.conn.NextReader()
 		if err != nil || kind != websocket.TextMessage {
 			return
 		}
-		var frame peerFrame
-		if json.Unmarshal(data, &frame) != nil || frame.Packet.Dest == "" || len(frame.Packet.Dests) != 0 || frame.Packet.sourceNodeID() == "" || frame.Packet.Type == "" || frame.Packet.Type == "reconnect" || frame.Hops >= 4 {
+		buffer.Reset()
+		if _, err := buffer.ReadFrom(reader); err != nil {
 			return
 		}
-		p := frame.Packet
-		if p.Timestamp == nil {
-			now := time.Now().UnixMilli()
-			p.Timestamp = &now
-		}
-		p.hops = frame.Hops + 1
-		p.replays = frame.Replays
-		link.mu.Lock()
-		link.recordLocked(p, time.Now())
-		link.mu.Unlock()
-		select {
-		case link.incoming <- p:
-		case <-link.done:
-			return
+		for data := buffer.Bytes(); len(data) != 0; {
+			raw, rest := data, []byte(nil)
+			if link.batch {
+				raw, rest, _ = bytes.Cut(data, []byte{'\n'})
+			}
+			data = rest
+			var frame peerFrame
+			if len(raw) > 1<<20+4096 || json.Unmarshal(raw, &frame) != nil || frame.Packet.Dest == "" || len(frame.Packet.Dests) != 0 || frame.Packet.sourceNodeID() == "" || frame.Packet.Type == "" || frame.Packet.Type == "reconnect" || frame.Hops >= 4 {
+				return
+			}
+			p := frame.Packet
+			if p.Timestamp == nil {
+				now := time.Now().UnixMilli()
+				p.Timestamp = &now
+			}
+			p.hops = frame.Hops + 1
+			p.replays = frame.Replays
+			link.mu.Lock()
+			link.recordLocked(p, time.Now())
+			link.mu.Unlock()
+			if !link.server.submit(p, nil) {
+				return
+			}
 		}
 	}
 }
 
-func (link *peerLink) processLoop() {
-	for p := range link.incoming {
-		link.server.route(p)
+// Reserve regular turns for data so a continuous stream of feedback cannot starve it.
+func (link *peerLink) takeFrame(dataFirst bool) []byte {
+	link.mu.Lock()
+	defer link.mu.Unlock()
+	if dataFirst {
+		if data := link.data.pop(); data != nil {
+			return data
+		}
 	}
+	if data := link.feedback.pop(); data != nil {
+		return data
+	}
+	return link.data.pop()
 }
 
 func (link *peerLink) writeLoop() {
 	defer link.close()
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
+	var batchBuffer []byte
+	turn := 0
 	for {
 		kind := websocket.TextMessage
 		var data []byte
@@ -1679,17 +1863,32 @@ func (link *peerLink) writeLoop() {
 		case <-ticker.C:
 			kind = websocket.PingMessage
 		default:
-			data = link.takeFeedback()
+			data = link.takeFrame(turn%8 == 0)
+			turn++
 			if data == nil {
 				select {
 				case <-link.done:
 					return
 				case <-ticker.C:
 					kind = websocket.PingMessage
-				case <-link.feedbackReady:
+				case <-link.ready:
 					continue
-				case data = <-link.send:
 				}
+			}
+		}
+		// Coalesce already queued frames only: no extra latency or client protocol change.
+		if link.batch && kind == websocket.TextMessage {
+			for n := 1; n < 32 && len(data) < 64<<10; n++ {
+				next := link.takeFrame(n%8 == 0)
+				if next == nil {
+					break
+				}
+				if n == 1 {
+					data = append(batchBuffer[:0], data...)
+				}
+				data = append(data, '\n')
+				data = append(data, next...)
+				batchBuffer = data
 			}
 		}
 		link.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
@@ -1704,7 +1903,7 @@ func (link *peerLink) recordLocked(p packet, now time.Time) {
 		return
 	}
 	link.history, link.head = pruneHistory(link.history, link.head, now.Add(-3*time.Second))
-	link.history = append(link.history, replayRecord{packet: p, sentAt: now})
+	link.history = append(link.history, replayRecord{packet: &p, sentAt: now})
 }
 
 func (link *peerLink) close() {
@@ -1728,12 +1927,12 @@ func (link *peerLink) close() {
 		link.history, link.head = pruneHistory(link.history, link.head, time.Now().Add(-3*time.Second))
 		replay := append([]replayRecord(nil), link.history[link.head:]...)
 		link.history, link.head = nil, 0
-		link.feedback, link.feedbackHead, link.feedbackBytes = nil, 0, 0
+		link.data, link.feedback = frameQueue{}, frameQueue{}
 		link.mu.Unlock()
 		if len(replay) != 0 {
 			go func() {
 				for _, item := range replay {
-					p := item.packet
+					p := *item.packet
 					p.replays++
 					s.route(p)
 				}
@@ -1758,13 +1957,16 @@ func (s *server) cleanupPeerLinks(now time.Time) {
 
 func pruneHistory(history []replayRecord, head int, cutoff time.Time) ([]replayRecord, int) {
 	for head < len(history) && history[head].sentAt.Before(cutoff) {
+		history[head] = replayRecord{}
 		head++
 	}
 	if head == len(history) {
 		return nil, 0
 	}
 	if head > 1024 && head*2 >= len(history) {
-		return append([]replayRecord(nil), history[head:]...), 0
+		n := copy(history, history[head:])
+		clear(history[n:])
+		return history[:n], 0
 	}
 	return history, head
 }

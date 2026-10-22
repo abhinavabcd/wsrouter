@@ -98,6 +98,7 @@ func TestRenewWithoutRing(t *testing.T) {
 	node := createNode(t, urls[0].URL, "account")
 	servers[0].mu.Lock()
 	servers[0].ring = nil
+	servers[0].routingRing.Store([]peer(nil))
 	servers[0].mu.Unlock()
 	req, _ := http.NewRequest(http.MethodPost, urls[0].URL+"/renew", nil)
 	req.Header.Set("Authorization", "Bearer "+node.token)

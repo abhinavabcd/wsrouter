@@ -95,15 +95,33 @@ Servers ping client sockets every `TCP_KEEP_ALIVE` seconds (default 30), overrid
 
 A shared cleanup job scans active histories and recent receipts; there is no timer per idle node. Replay is best effort and can create duplicates. Process crashes lose in-memory queues. `success` is an enqueue notice, not a final delivery guarantee.
 
-Packets are limited to 1 MiB. Each client has a 4,096-packet send queue and a 1,024-packet routing queue capped at 4 MiB. Peer feedback has a separate prioritized backlog capped at 64 MiB; feedback enqueue never blocks routing workers. Overload failures appear in `/health` counters. `/health` also reports ring size and distinct local nodes.
+Packets are limited to 1 MiB. Each client has a 1,024-packet send queue capped at 4 MiB. Incoming fanout is expanded into bounded shared routing queues: 4 MiB of pending work per source connection and 128 MiB per server. Routing uses up to eight workers, chosen from `GOMAXPROCS`, and consistently assigns a destination node to a worker. Connection lifecycle and replay cleanup retain their locks. Slow/full client queues close the socket; a full peer queue returns a routing failure instead of blocking a worker.
+
+Peer data and feedback use separate queues that grow on demand, each capped at 64 MiB. Feedback is prioritized with regular data turns to avoid starvation. New peers negotiate `X-Peer-Batching: 1`; queued JSON frames may then share a WebSocket message, with up to 32 newline-separated frames per batch and no deliberate batching delay. Legacy peers continue using one JSON frame per message. Read and batch-write buffers are reused per peer.
+
+The hash ring is published as an immutable routing snapshot. Existing peer connections bypass dial locks; new dials are serialized per peer. Client pings use one heap scheduler/timer per server, while socket writes remain in their writer goroutines. Replay records reference immutable packets and expiry releases old references. Byte limits cover queues, not all retained replay payloads or total process memory. `/health` reports routing/feedback errors, ring size, and distinct local nodes. See [PERFORMANCE.md](PERFORMANCE.md) for measurements and limitations.
 
 The full ring snapshots and single membership coordinator impose practical scaling limits; this system is not infinitely scalable or coordinator fault tolerant.
 
 ## Tests
 
 ```sh
-go test -race ./...
+go test -race ./... # Go 1.25+; production builder currently uses Go 1.27.3
 WSROUTER_STRESS=1 go test -run TestStressFiveServers -count=1 -v -timeout=10m
 ```
 
 Tests use trusted local TLS certificates with hostname verification enabled. The stress test starts five HTTPS servers and 1,000 WSS clients, 200 created through each server. Every client sends to the other 999, mixing fanout and individual packets. It waits for 999,000 data packets and 999,000 success statuses, checking identity and deduplicating replay. The verifier supplies `rp5: 1000` for these clients. Set `WSROUTER_STRESS_NODES=50` for a smaller run.
+
+Reproduce the controlled performance runs with the Dockerfile's Go image:
+
+```sh
+./stress_test.sh                         # three 1,000-node all-to-all runs
+RUNS=0 WSROUTER_STEADY=1 ./stress_test.sh # 40 seconds of sustained traffic
+```
+
+The runner defaults to four CPUs, `GOMAXPROCS=4`, and 6 GiB container memory.
+Override `CPUS` with an integer, `MEMORY`, `RUNS`, or `WSROUTER_STRESS_NODES` as needed.
+The sustained test uses 100 clients, 1 KiB payloads, about 5,000 messages/second,
+and the default 30-second replay window. It reports success-feedback p50/p99,
+sampled heap, and allocations. Both tests include the load generators in the same
+process as the five test routers; these results are not production capacity limits.

@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,7 +102,7 @@ func waitConnections(t *testing.T, s *server, nodeID string, want int) {
 			state.mu.Unlock()
 		}
 		s.mu.RUnlock()
-		if count >= want {
+		if count == want {
 			return
 		}
 		if time.Now().After(deadline) {
@@ -495,6 +496,10 @@ func TestStressFiveServers(t *testing.T) {
 			t.Fatalf("server %d has no connected nodes", i)
 		}
 	}
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	t.Logf("idle: heap=%.1f MiB goroutines=%d", float64(before.HeapAlloc)/(1<<20), runtime.NumGoroutine())
 	start := time.Now()
 	var wg sync.WaitGroup
 	var receivedData, receivedStatus atomic.Int64
@@ -611,6 +616,9 @@ func TestStressFiveServers(t *testing.T) {
 			t.Fatal(err)
 		case <-done:
 			elapsed := time.Since(start)
+			var after runtime.MemStats
+			runtime.ReadMemStats(&after)
+			t.Logf("load: alloc=%.1f MiB heap=%.1f MiB gc=%d", float64(after.TotalAlloc-before.TotalAlloc)/(1<<20), float64(after.HeapAlloc)/(1<<20), after.NumGC-before.NumGC)
 			for _, s := range servers {
 				s.cleanupReceipts(time.Now().Add(31 * time.Second))
 			}
@@ -624,11 +632,11 @@ func TestStressFiveServers(t *testing.T) {
 				statuses += s.statusErrors.Load()
 				s.peerMu.Lock()
 				for link := range s.allPeerLinks {
-					queuedData += len(link.send)
 					link.mu.Lock()
-					queuedFeedback += len(link.feedback) - link.feedbackHead
+					queuedFeedback += len(link.feedback.entries) - link.feedback.head
+					queuedData += len(link.data.entries) - link.data.head
 					link.mu.Unlock()
-					queuedIncoming += len(link.incoming)
+
 				}
 				s.peerMu.Unlock()
 			}
@@ -799,11 +807,13 @@ func TestDisconnectReroutesToNewOwnerBeforeFeedback(t *testing.T) {
 	newRing := []peer{{ID: servers[1].id, Addr: urls[1].URL, AuthToken: servers[1].serverToken}}
 	servers[1].mu.Lock()
 	servers[1].ring = newRing
+	servers[1].routingRing.Store(newRing)
 	servers[1].mu.Unlock()
 	newConn := connectNode(t, urls[1].URL, dest.token, "")
 	waitConnections(t, servers[1], dest.id, 1)
 	servers[0].mu.Lock()
 	servers[0].ring = newRing
+	servers[0].routingRing.Store(newRing)
 	servers[0].mu.Unlock()
 	oldConn.Close()
 	newConn.SetReadDeadline(time.Now().Add(3 * time.Second))
