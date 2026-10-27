@@ -51,6 +51,9 @@ func TestCORSAndVerifierOrigin(t *testing.T) {
 	if err != nil || resp.StatusCode != 200 || resp.Header.Get("Access-Control-Allow-Origin") != "*" {
 		t.Fatalf("create: %s, %v", resp.Status, err)
 	}
+	if got := <-origins; got != "https://any.example" {
+		t.Fatalf("create lost origin: %q", got)
+	}
 	owner, _ := servers[0].owner(node.ID)
 	for _, origin := range []string{"https://any.example", "https://denied.example", "null", ""} {
 		headers := http.Header{}

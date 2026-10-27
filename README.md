@@ -28,7 +28,7 @@ Example response:
 {"node_id":"auth.example.com|0123456789abcdef0123456789abcdef","token":"/verify|opaque-secret","address":"https://sub1.example.com:8443"}
 ```
 
-`auth_domain` is a hostname with an optional port, without a scheme or path. `path` starts with `/` and can include query parameters. The first `|` separates the path from the secret, so the secret may contain additional `|` characters. Creation constructs the credentials; authentication occurs when they are used. The external authority must already recognize the supplied secret and decide which node IDs it permits.
+`auth_domain` is a hostname with an optional port, without a scheme or path. `path` starts with `/` and can include query parameters. The first `|` separates the path from the secret, so the secret may contain additional `|` characters. Creation generates a candidate node ID and verifies it before returning credentials. A denied, invalid, or unavailable verifier response returns HTTP 401 without credentials. The external authority must already recognize the supplied secret and decide which node IDs it permits.
 
 Connect to `/connect` using URL-encoded `node_id` and `token` query parameters. Non-browser clients can instead send `X-Node-ID` and `Authorization: Bearer TOKEN`. Both identity and token are required. The router sends:
 
@@ -49,7 +49,7 @@ Boolean `true` is also accepted. `maxc` is an optional positive integer, default
 
 The verifier can additionally return `x_src_id` and `expires` (Unix seconds). Without them, `x_src_id` defaults to the node ID and validity is decided by the authority on each authentication. A returned expiry must be in the future. `/create` no longer accepts trusted identity, rate, or lifetime claims from the caller: the authority supplies them. Old HMAC tokens are incompatible with this protocol.
 
-`GET /locate` takes the same credentials, verifies them, and returns the ring owner's `address`. `/connect` returns HTTP 421 and `{"address":"https://owner:port"}` if the node belongs elsewhere. Browser WebSocket APIs cannot read that response body, so browser clients should use `/locate` before connecting. WebSocket origins from any domain are accepted. `/create` and `/connect` (along with the other HTTP endpoints) return `Access-Control-Allow-Origin: *` and answer CORS preflight requests. If an incoming request includes `Origin`, the router forwards it unchanged as the `Origin` header on its HTTPS verification request, including lookup and renewal. The authority can approve or deny that origin through its usual `valid` response. Requests without `Origin` leave it absent. `/create` constructs credentials without a verifier call; origin policy is checked when the credentials are used.
+`GET /locate` takes the same credentials, verifies them, and returns the ring owner's `address`. `/connect` returns HTTP 421 and `{"address":"https://owner:port"}` if the node belongs elsewhere. Browser WebSocket APIs cannot read that response body, so browser clients should use `/locate` before connecting. WebSocket origins from any domain are accepted. `/create` and `/connect` (along with the other HTTP endpoints) return `Access-Control-Allow-Origin: *` and answer CORS preflight requests. If an incoming request includes `Origin`, the router forwards it unchanged as the `Origin` header on its HTTPS verification request, including lookup and renewal. The authority can approve or deny that origin through its usual `valid` response. Requests without `Origin` leave it absent. `/create` also forwards Origin and checks approval before returning credentials.
 
 ## Renewal
 
@@ -95,9 +95,21 @@ Servers ping client sockets every `TCP_KEEP_ALIVE` seconds (default 30), overrid
 
 A shared cleanup job scans active histories and recent receipts; there is no timer per idle node. Replay is best effort and can create duplicates. Process crashes lose in-memory queues. `success` is an enqueue notice, not a final delivery guarantee.
 
+Packets must contain valid UTF-8 JSON. Routing fields (`_id`, source IDs,
+`x_src_id`, and each destination ID) are limited to 1,024 bytes; `type` is limited
+to 128 bytes. Invalid envelopes close that socket. If adding canonical fields would make a
+drop reply exceed 1 MiB, the socket closes instead of emitting an oversized reply. Peer batches accept at most
+32 frames and reject invalid hop/replay metadata. An empty membership snapshot
+cannot replace a live ring. `/create` and `/refresh` require one complete JSON
+value, rejecting trailing data.
+
+Blocking/unblocking is client-owned: those type names have no special router
+behavior. `rp5` remains per connection and per incoming packet; fanout consumes
+one allowance, not one per destination. Queue byte caps remain in effect.
+
 Packets are limited to 1 MiB. Each client has a 1,024-packet send queue capped at 4 MiB. Incoming fanout is expanded into bounded shared routing queues: 4 MiB of pending work per source connection and 128 MiB per server. Routing uses up to eight workers, chosen from `GOMAXPROCS`, and consistently assigns a destination node to a worker. Connection lifecycle and replay cleanup retain their locks. Slow/full client queues close the socket; a full peer queue returns a routing failure instead of blocking a worker.
 
-Peer data and feedback use separate queues that grow on demand, each capped at 64 MiB. Feedback is prioritized with regular data turns to avoid starvation. New peers negotiate `X-Peer-Batching: 1`; queued JSON frames may then share a WebSocket message, with up to 32 newline-separated frames per batch and no deliberate batching delay. Legacy peers continue using one JSON frame per message. Read and batch-write buffers are reused per peer.
+Client read buffers up to 64 KiB are reused across messages; larger buffers are released before waiting for more input. Peer data and feedback use separate queues that grow on demand, each capped at 64 MiB. Feedback is prioritized with regular data turns to avoid starvation. New peers negotiate `X-Peer-Batching: 1`; queued JSON frames may then share a WebSocket message, with up to 32 newline-separated frames per batch and no deliberate batching delay. Legacy peers continue using one JSON frame per message. Read and batch-write buffers are reused per peer.
 
 The hash ring is published as an immutable routing snapshot. Existing peer connections bypass dial locks; new dials are serialized per peer. Client pings use one heap scheduler/timer per server, while socket writes remain in their writer goroutines. Replay records reference immutable packets and expiry releases old references. Byte limits cover queues, not all retained replay payloads or total process memory. `/health` reports routing/feedback errors, ring size, and distinct local nodes. See [PERFORMANCE.md](PERFORMANCE.md) for measurements and limitations.
 
@@ -125,3 +137,8 @@ The sustained test uses 100 clients, 1 KiB payloads, about 5,000 messages/second
 and the default 30-second replay window. It reports success-feedback p50/p99,
 sampled heap, and allocations. Both tests include the load generators in the same
 process as the five test routers; these results are not production capacity limits.
+
+Malformed-input regressions cover JSON syntax/type errors, null envelopes,
+oversized IDs and messages, invalid UTF-8, deep nesting, bad fanout, peer
+metadata/batches, and normal closure during a fragmented message. Run the bounded
+parser fuzz test with `go test -run '^$' -fuzz FuzzPacketEnvelope -fuzztime=30s .`.

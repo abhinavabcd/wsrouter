@@ -55,6 +55,7 @@ func createNode(t *testing.T, baseURL, xSrc string, rp5 ...int64) testNode {
 		rate = rp5[0]
 	}
 	secret := randomTestSecret()
+	fixtureAccounts.Store(secret, &fixtureAccount{source: xSrc, rate: rate})
 	body, _ := json.Marshal(map[string]any{"auth_domain": strings.TrimPrefix(fixtureAuthURL, "https://"), "path": "/verify", "secret_string": secret})
 	resp, err := http.Post(baseURL+"/create", "application/json", bytes.NewReader(body))
 	if err != nil {
@@ -68,7 +69,6 @@ func createNode(t *testing.T, baseURL, xSrc string, rp5 ...int64) testNode {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || resp.StatusCode != 200 {
 		t.Fatalf("create: %s, %v", resp.Status, err)
 	}
-	fixtureAccounts.Store(secret, &fixtureAccount{nodeID: out.NodeID, source: xSrc, rate: rate})
 	fixtureTokens.Store(out.Token, out.NodeID)
 	return testNode{id: out.NodeID, token: out.Token}
 }

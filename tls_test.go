@@ -110,6 +110,7 @@ func TestHTTPSWSSAndCertificateReload(t *testing.T) {
 	create := func(xSrc string) testNode {
 		t.Helper()
 		secret := randomTestSecret()
+		fixtureAccounts.Store(secret, &fixtureAccount{source: xSrc, rate: 10})
 		body, _ := json.Marshal(map[string]string{"auth_domain": strings.TrimPrefix(fixtureAuthURL, "https://"), "path": "/verify", "secret_string": secret})
 		response, err := client.Post(baseURL+"/create", "application/json", bytes.NewReader(body))
 		if err != nil {
@@ -126,7 +127,6 @@ func TestHTTPSWSSAndCertificateReload(t *testing.T) {
 		if err := json.NewDecoder(response.Body).Decode(&node); err != nil {
 			t.Fatal(err)
 		}
-		fixtureAccounts.Store(secret, &fixtureAccount{nodeID: node.NodeID, source: xSrc, rate: 10})
 		return testNode{id: node.NodeID, token: node.Token}
 	}
 	source, dest := create("source"), create("dest")

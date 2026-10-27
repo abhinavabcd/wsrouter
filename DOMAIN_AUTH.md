@@ -23,7 +23,7 @@ Content-Type: application/json
 {"node_id":"auth.example.com|0123456789abcdef0123456789abcdef","secret":"opaque-secret"}
 ```
 
-An incoming `Origin` header is forwarded unchanged to the verifier; if absent, no `Origin` header is added. The authority decides whether that origin is permitted. This also applies to lookup and renewal, including renewal at a non-owner server. `/create` supports CORS from any domain but only constructs credentials; it does not call the verifier.
+An incoming `Origin` header is forwarded unchanged to the verifier; if absent, no `Origin` header is added. The authority decides whether that origin is permitted. This also applies to lookup and renewal, including renewal at a non-owner server. `/create` supports CORS from any domain and verifies the generated candidate node ID and supplied secret before returning credentials. Denied, invalid, or unavailable verification returns HTTP 401.
 
 The JSON body contains `node_id` and `secret`. The node ID is also retained in the query for compatibility. Existing `node_id` query values are replaced; other parameters are preserved. The router controls the `action` query parameter, adding `action=renew` for renewal and removing it for ordinary authentication.
 

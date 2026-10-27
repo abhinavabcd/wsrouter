@@ -29,6 +29,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 	"golang.org/x/net/publicsuffix"
@@ -489,7 +490,8 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) error {
 		Path       string `json:"path"`
 		Secret     string `json:"secret_string"`
 	}
-	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 12288)).Decode(&req) != nil {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 12288))
+	if err != nil || json.Unmarshal(body, &req) != nil {
 		return httpStatus(400)
 	}
 	domain, err := authAuthority(req.AuthDomain)
@@ -505,6 +507,9 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	nodeID := domain + "|" + hex.EncodeToString(id)
+	if _, err := s.authenticate(r.Context(), nodeID, token, "", r.Header.Get("Origin")); err != nil {
+		return httpStatus(http.StatusUnauthorized)
+	}
 	result := map[string]any{"node_id": nodeID, "token": token}
 	if owner, ok := s.owner(nodeID); ok {
 		result["address"] = owner.Addr
@@ -689,7 +694,8 @@ func (s *server) refresh(w http.ResponseWriter, r *http.Request) error {
 		return httpStatus(404)
 	}
 	var p peer
-	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&p) != nil || p.Nodes < 0 {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8192))
+	if err != nil || json.Unmarshal(body, &p) != nil || p.Nodes < 0 {
 		return httpStatus(400)
 	}
 	if err := s.verifyServerNode(r, p.ID); err != nil {
@@ -890,6 +896,9 @@ func (s *server) snapshotLocked() []peer {
 }
 
 func (s *server) applySnapshot(snapshot []peer, epoch int64, version uint64) bool {
+	if len(snapshot) == 0 {
+		return false
+	}
 	snapshot = append([]peer(nil), snapshot...)
 	sort.Slice(snapshot, func(i, j int) bool { return snapshot[i].ID < snapshot[j].ID })
 	s.mu.Lock()
@@ -1123,25 +1132,30 @@ func (cl *client) readLoop() {
 	cl.conn.SetPongHandler(func(string) error {
 		return cl.conn.SetReadDeadline(time.Now().Add(cl.keepAlive + 10*time.Second))
 	})
+	var buffer bytes.Buffer
 	for {
-		kind, data, err := cl.conn.ReadMessage()
+		// Do not pin a large one-off message on an otherwise idle connection.
+		if buffer.Cap() > 64<<10 {
+			buffer = bytes.Buffer{}
+		}
+		kind, reader, err := cl.conn.NextReader()
+		if err == nil {
+			if kind != websocket.TextMessage {
+				return
+			}
+			buffer.Reset()
+			_, err = buffer.ReadFrom(reader)
+		}
 		if err != nil {
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 				cl.normalClose.Store(true)
 			}
 			return
 		}
-		if kind != websocket.TextMessage {
-			return
-		}
+		data := buffer.Bytes()
 		p, err := decodePacket(data)
-		if err != nil || p.Type == "" || p.Type == "reconnect" || (p.Dest == "" && len(p.Dests) == 0) || (p.Dest != "" && len(p.Dests) != 0) || len(p.Dests) > 1024 {
+		if err != nil || !p.validRoute() {
 			return
-		}
-		for _, dest := range p.Dests {
-			if dest == "" {
-				return
-			}
 		}
 		if cl.nodeType == "server" {
 			if p.sourceNodeID() == "" {
@@ -1205,6 +1219,10 @@ func (cl *client) drop(p packet, original []byte, reason string) {
 	// Merge canonical fields while retaining any extra fields from the input.
 	json.Unmarshal(updated, &fields)
 	data, _ := json.Marshal(fields)
+	if len(data) > 1<<20 {
+		cl.close()
+		return
+	}
 	cl.enqueue(outbound{data: data})
 }
 
@@ -1464,8 +1482,27 @@ func decodePacket(data []byte) (packet, error) {
 	if len(data) > 1<<20 {
 		return p, errors.New("packet too large")
 	}
+	if !utf8.Valid(data) {
+		return p, errors.New("invalid UTF-8")
+	}
 	err := json.Unmarshal(data, &p)
 	return p, err
+}
+
+// Shared routing envelope limits bound fanout, hashing, and feedback size.
+func (p packet) validRoute() bool {
+	if p.Type == "" || p.Type == "reconnect" || len(p.Type) > 128 || len(p.PacketID) > 1024 || len(p.Src) > 1024 || len(p.SrcNodeID) > 1024 || len(p.XSrc) > 1024 || len(p.Dest) > 1024 || len(p.Dests) > 1024 {
+		return false
+	}
+	if (p.Dest == "") == (len(p.Dests) == 0) {
+		return false
+	}
+	for _, dest := range p.Dests {
+		if dest == "" || len(dest) > 1024 {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *server) peerToken(id uint64) (string, bool) {
@@ -1805,6 +1842,9 @@ func (link *peerLink) readLoop() {
 		if _, err := buffer.ReadFrom(reader); err != nil {
 			return
 		}
+		if link.batch && bytes.Count(buffer.Bytes(), []byte{'\n'}) >= 32 {
+			return
+		}
 		for data := buffer.Bytes(); len(data) != 0; {
 			raw, rest := data, []byte(nil)
 			if link.batch {
@@ -1812,13 +1852,16 @@ func (link *peerLink) readLoop() {
 			}
 			data = rest
 			var frame peerFrame
-			if len(raw) > 1<<20+4096 || json.Unmarshal(raw, &frame) != nil || frame.Packet.Dest == "" || len(frame.Packet.Dests) != 0 || frame.Packet.sourceNodeID() == "" || frame.Packet.Type == "" || frame.Packet.Type == "reconnect" || frame.Hops >= 4 {
+			if len(raw) > 1<<20+4096 || !utf8.Valid(raw) || json.Unmarshal(raw, &frame) != nil || !frame.Packet.validRoute() || len(frame.Packet.Dests) != 0 || frame.Packet.sourceNodeID() == "" || frame.Hops >= 4 || frame.Replays > 3 {
 				return
 			}
 			p := frame.Packet
 			if p.Timestamp == nil {
 				now := time.Now().UnixMilli()
 				p.Timestamp = &now
+			}
+			if p.PacketID == "" {
+				p.PacketID = link.server.packetPrefix + strconv.FormatUint(link.server.nextPacketID.Add(1), 36)
 			}
 			p.hops = frame.Hops + 1
 			p.replays = frame.Replays

@@ -115,3 +115,50 @@ Regression checks cover immutable snapshot publication, established peers bypass
 dial locks, byte limits, rejection without recording unsent peer packets, fair data
 turns alongside feedback, heartbeat intervals and removal, legacy and batched peer
 frames, expiry releasing references, maxc eviction, routing, and replay behavior.
+
+## Core cleanup and packet validation (2026-10-27)
+
+Measured against the reverted router, with no blocking or storage features.
+The final change shares routing-envelope validation between client and peer
+inputs and reuses client read buffers. Buffers larger than 64 KiB are released
+before waiting for another message, limiting retained memory after large inputs.
+No runtime dependencies, worker queues, per-node timers, or protocol features
+were added.
+
+Three fresh processes per variant, Go 1.27.3, four CPUs/GOMAXPROCS=4, 6 GiB limit,
+five routers, and 1,000 clients. Every run delivered 999,000 data messages and
+999,000 success replies.
+
+| Measurement | Before | Final |
+| --- | --- | --- |
+| Individual routing times (s) | 7.397, 7.548, 7.367 | 7.179, 7.252, 7.408 |
+| Median routing time (s) | 7.397 | 7.252 |
+| Median allocations during traffic (MiB) | 7,546.0 | 7,321.4 |
+| Idle heap (MiB) | 99.3 | 99.3 |
+
+Allocations fell about 3%. The observed median runtime fell about 2%, but the
+ranges overlap: three runs do not establish a statistically significant speedup.
+Both measurements include the load generators. The final sustained 40-second
+run completed 199,861 messages and feedback replies, with p50=1 ms, p99=4 ms,
+sampled maximum heap=367.8 MiB, and 3,134.7 MiB allocated. No new sustained
+baseline was taken for this review; earlier results above used different runs.
+
+Validation passed: full race suite, vet, CGO-disabled production build, three
+all-to-all runs, sustained traffic, and a 30-second parser fuzz run with 336,786
+executions. Regression tests exercise malformed and oversized client/peer frames,
+invalid raw UTF-8, JSON nesting/type/number errors, bad fanout, excessive peer
+batches/replay metadata, trailing HTTP JSON, oversized drop replies, empty ring
+updates, and normal closure during a fragmented message. Invalid sockets are
+closed while unrelated routing remains operational. Fuzzing is bounded testing,
+not a proof that arbitrary inputs can never exhaust resources.
+
+Routing fields now have explicit byte limits (1,024 bytes, or 128 for type),
+documented in README.md. Empty ring updates are guarded at the state transition
+as well as the HTTP boundary. Peer batches exceeding 32 frames are rejected
+before processing their frames.
+
+The next capacity concern is replay retention: queue byte limits do not bound
+all retained payloads, and rp5 counts one incoming fanout request as one packet.
+A global replay-memory budget would require an explicit policy for rejecting
+traffic when it cannot preserve the promised lookback window. This review keeps
+those existing semantics rather than silently truncating retained messages.

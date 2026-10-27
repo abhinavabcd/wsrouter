@@ -95,6 +95,10 @@ func TestMain(m *testing.M) {
 		account := raw.(*fixtureAccount)
 		account.mu.Lock()
 		defer account.mu.Unlock()
+		// Test accounts authorize their first proposed node ID during /create.
+		if account.nodeID == "" {
+			account.nodeID = credentials.NodeID
+		}
 		if credentials.NodeID != account.nodeID || r.URL.Query().Get("node_id") != account.nodeID || account.denied {
 			http.Error(w, "denied", 401)
 			return
