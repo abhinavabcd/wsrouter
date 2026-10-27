@@ -107,13 +107,16 @@ func TestInvalidTimeDropPreservesFieldsAndSocket(t *testing.T) {
 			t.Fatalf("drop did not preserve extra JSON fields: %s", raw)
 		}
 	}
+	other := connectNode(t, urls[0].URL, node.token, "")
+	waitConnections(t, servers[0], node.id, 2)
+	other.SetReadDeadline(time.Now().Add(time.Second))
 	stamp := time.Now().UnixMilli() - 1000
 	data, _ := encodePacket(packet{PacketID: "after-drop", Type: "data", Dest: node.id, Payload: "accepted", Timestamp: &stamp})
 	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
 		t.Fatal(err)
 	}
 	for _, wantType := range []string{"data", "status"} {
-		_, raw, err := conn.ReadMessage()
+		_, raw, err := other.ReadMessage()
 		if err != nil {
 			t.Fatal(err)
 		}

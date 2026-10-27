@@ -77,7 +77,19 @@ Send JSON text frames with string payloads. Base64-encode binary data when neede
 {"_id":"message-1","type":"data","dest_node_id":"auth.example.com|destination-id","payload":"AP8="}
 ```
 
-Use `dest_node_ids` for fanout (1–1,024 destinations), or `dest_node_id` for one destination, but not both. Each copy has one `dest_node_id`, preserves the same `_id`, and routes to every connection for that destination. Missing or empty `_id` values are generated. Hashing includes the whole domain-prefixed node ID.
+Use `dest_node_ids` for fanout (1–1,024 destinations), or `dest_node_id` for one destination, but not both. Each copy has one `dest_node_id`, preserves the same `_id`, and routes to every eligible connection for that destination. Missing or empty `_id` values are generated. Hashing includes the whole domain-prefixed node ID.
+
+Each connection receives a router-assigned socket ID. If a packet targets its own
+source node, it skips the socket that issued it and reaches the node's other
+connections. This applies to single-destination sends, fanout including self,
+and replay. Generated status feedback still reaches the originating socket.
+A self-send with no other eligible connection receives `status: failed`.
+
+The source socket ID is internal metadata: client-supplied `src_socket_id` cannot
+override it, and it is not included in application packets. Peer frames preserve
+it so a packet returning to the same router still skips its origin. New sockets
+get new IDs even after the node's last connection closes. Older peers ignore this
+optional metadata; replay through an older peer cannot preserve this exclusion.
 
 Regular nodes may provide an integer Unix millisecond `timestamp` between the server's receive time minus 8,000 milliseconds and its current time, inclusive. A missing/null timestamp is filled by the server. An invalid time produces `type: "drop", payload: "invalid_time"`, with the other input fields copied. Server nodes preserve supplied timestamps without drift checks. Replay preserves the original ID and timestamp.
 

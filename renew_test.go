@@ -51,7 +51,7 @@ func TestRenewAtOwnerClosesOnlyRenewedNode(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := decodePacket(raw)
-	if err != nil || got.Payload != "still-connected" {
+	if err != nil || got.Type != "status" || got.Payload != "failed" || got.SrcNodeID != other.id {
 		t.Fatalf("unrelated socket changed: %+v, %v", got, err)
 	}
 }

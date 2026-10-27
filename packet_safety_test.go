@@ -54,14 +54,16 @@ func TestMalformedClientPacketsAreIsolated(t *testing.T) {
 	}
 	// Invalid input must not stop the listener or other routing workers.
 	conn := connectNode(t, urls[0].URL, node.token, "")
-	waitConnections(t, s, node.id, 1)
+	other := connectNode(t, urls[0].URL, node.token, "")
+	waitConnections(t, s, node.id, 2)
 	if err := conn.WriteJSON(packet{Type: "block", Dest: node.id, PacketID: "ordinary-client-payload"}); err != nil {
 		t.Fatal(err)
 	}
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	other.SetReadDeadline(time.Now().Add(3 * time.Second))
 	for _, kind := range []string{"block", "status"} {
 		var p packet
-		if err := conn.ReadJSON(&p); err != nil || p.Type != kind || p.PacketID != "ordinary-client-payload" {
+		if err := other.ReadJSON(&p); err != nil || p.Type != kind || p.PacketID != "ordinary-client-payload" {
 			t.Fatalf("router not healthy: %+v %v", p, err)
 		}
 	}

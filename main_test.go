@@ -332,12 +332,15 @@ func TestTwoServerRoutingKeysAndCORS(t *testing.T) {
 		t.Fatalf("wrong sent status: %+v, %v", sent, err)
 	}
 
+	localReceiver := connectNode(t, leaderURL, source.token, "")
+	waitConnections(t, leader, source.id, 2)
 	local, _ := encodePacket(packet{Type: "local", Dest: source.id, Payload: "self"})
 	if err := src.WriteMessage(websocket.TextMessage, local); err != nil {
 		t.Fatal(err)
 	}
 	src.SetReadDeadline(time.Now().Add(3 * time.Second))
-	_, localData, err := src.ReadMessage()
+	localReceiver.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, localData, err := localReceiver.ReadMessage()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,7 +424,7 @@ func TestRenewOnDifferentServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	delivered, err := decodePacket(raw)
-	if err != nil || delivered.Payload != "reconnected" || delivered.SrcNodeID != node.id {
+	if err != nil || delivered.Type != "status" || delivered.Payload != "success" || delivered.SrcNodeID != node.id {
 		t.Fatalf("renewed token did not reconnect: %+v, %v", delivered, err)
 	}
 }

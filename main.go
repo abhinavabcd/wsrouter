@@ -54,17 +54,18 @@ type member struct {
 }
 
 type packet struct {
-	PacketID  string   `json:"_id,omitempty"`
-	Timestamp *int64   `json:"timestamp,omitempty"`
-	Type      string   `json:"type"`
-	Dest      string   `json:"dest_node_id,omitempty"`
-	Dests     []string `json:"dest_node_ids,omitempty"`
-	Src       string   `json:"src_id,omitempty"`
-	SrcNodeID string   `json:"src_node_id"`
-	XSrc      string   `json:"x_src_id,omitempty"`
-	Payload   string   `json:"payload"`
-	hops      uint8
-	replays   uint8
+	PacketID    string   `json:"_id,omitempty"`
+	Timestamp   *int64   `json:"timestamp,omitempty"`
+	Type        string   `json:"type"`
+	Dest        string   `json:"dest_node_id,omitempty"`
+	Dests       []string `json:"dest_node_ids,omitempty"`
+	Src         string   `json:"src_id,omitempty"`
+	SrcNodeID   string   `json:"src_node_id"`
+	XSrc        string   `json:"x_src_id,omitempty"`
+	Payload     string   `json:"payload"`
+	srcSocketID string   // internal origin; never accepted from client JSON
+	hops        uint8
+	replays     uint8
 }
 type replayRecord struct {
 	packet *packet
@@ -108,6 +109,7 @@ type routedPacket struct {
 }
 
 type client struct {
+	socketID        string
 	pingIndex       int // guarded by server.pingMu
 	nextPing        time.Time
 	ping            chan struct{}
@@ -176,9 +178,10 @@ type server struct {
 }
 
 type peerFrame struct {
-	Packet  packet `json:"packet"`
-	Hops    uint8  `json:"hops,omitempty"`
-	Replays uint8  `json:"replays,omitempty"`
+	SrcSocketID string `json:"src_socket_id,omitempty"`
+	Packet      packet `json:"packet"`
+	Hops        uint8  `json:"hops,omitempty"`
+	Replays     uint8  `json:"replays,omitempty"`
 }
 
 type frameQueue struct {
@@ -599,7 +602,7 @@ func (s *server) connect(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return nil
 	}
-	cl := &client{pingIndex: -1, ping: make(chan struct{}, 1), conn: conn, nodeID: c.NodeID, xSrcID: c.XSrcID, nodeType: c.NodeType, rp5: c.RP5, keepAlive: keepAlive, send: make(chan outbound, 1024), done: make(chan struct{}), server: s}
+	cl := &client{socketID: s.packetPrefix + "s" + strconv.FormatUint(s.nextPacketID.Add(1), 36), pingIndex: -1, ping: make(chan struct{}, 1), conn: conn, nodeID: c.NodeID, xSrcID: c.XSrcID, nodeType: c.NodeType, rp5: c.RP5, keepAlive: keepAlive, send: make(chan outbound, 1024), done: make(chan struct{}), server: s}
 	var evicted []*client
 	s.mu.Lock()
 	state := s.nodes[c.NodeID]
@@ -1025,6 +1028,9 @@ func (s *server) deliver(p packet, data []byte) bool {
 	}
 	state.mu.Lock()
 	for cl := range state.connections {
+		if p.Dest == p.sourceNodeID() && p.srcSocketID != "" && cl.socketID == p.srcSocketID {
+			continue
+		}
 		select {
 		case <-cl.done:
 			continue
@@ -1168,6 +1174,7 @@ func (cl *client) readLoop() {
 			p.Src, p.XSrc = cl.nodeID, cl.xSrcID
 			p.SrcNodeID = cl.nodeID
 		}
+		p.srcSocketID = cl.socketID
 		now := time.Now().UnixMilli()
 		if p.Timestamp == nil {
 			p.Timestamp = &now
@@ -1256,7 +1263,7 @@ func (s *server) startRouting() {
 func (s *server) submit(p packet, source *client) bool {
 	s.startRouting()
 	// Count the expanded destination's retained fields, not the entire fanout list.
-	size := int64(len(p.Payload) + len(p.Dest) + len(p.Src) + len(p.SrcNodeID) + len(p.XSrc) + len(p.PacketID) + len(p.Type) + 160)
+	size := int64(len(p.Payload) + len(p.Dest) + len(p.Src) + len(p.SrcNodeID) + len(p.XSrc) + len(p.PacketID) + len(p.Type) + len(p.srcSocketID) + 176)
 	if source != nil && source.pendingBytes.Add(size) > 4<<20 {
 		source.pendingBytes.Add(-size)
 		return false
@@ -1796,6 +1803,9 @@ func (s *server) addPeerLink(peerID uint64, conn *websocket.Conn, batch bool) *p
 
 func (link *peerLink) enqueue(ctx context.Context, p packet) error {
 	frame := peerFrame{Packet: p, Hops: p.hops, Replays: p.replays}
+	if p.Dest == p.sourceNodeID() {
+		frame.SrcSocketID = p.srcSocketID
+	}
 	data, _ := json.Marshal(frame)
 	if len(data) > 1<<20+4096 {
 		return errors.New("peer packet too large")
@@ -1852,7 +1862,7 @@ func (link *peerLink) readLoop() {
 			}
 			data = rest
 			var frame peerFrame
-			if len(raw) > 1<<20+4096 || !utf8.Valid(raw) || json.Unmarshal(raw, &frame) != nil || !frame.Packet.validRoute() || len(frame.Packet.Dests) != 0 || frame.Packet.sourceNodeID() == "" || frame.Hops >= 4 || frame.Replays > 3 {
+			if len(raw) > 1<<20+4096 || !utf8.Valid(raw) || json.Unmarshal(raw, &frame) != nil || !frame.Packet.validRoute() || len(frame.Packet.Dests) != 0 || frame.Packet.sourceNodeID() == "" || frame.Hops >= 4 || frame.Replays > 3 || len(frame.SrcSocketID) > 128 {
 				return
 			}
 			p := frame.Packet
@@ -1863,6 +1873,7 @@ func (link *peerLink) readLoop() {
 			if p.PacketID == "" {
 				p.PacketID = link.server.packetPrefix + strconv.FormatUint(link.server.nextPacketID.Add(1), 36)
 			}
+			p.srcSocketID = frame.SrcSocketID
 			p.hops = frame.Hops + 1
 			p.replays = frame.Replays
 			link.mu.Lock()

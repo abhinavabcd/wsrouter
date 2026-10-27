@@ -162,3 +162,23 @@ all retained payloads, and rp5 counts one incoming fanout request as one packet.
 A global replay-memory budget would require an explicit policy for rejecting
 traffic when it cannot preserve the promised lookback window. This review keeps
 those existing semantics rather than silently truncating retained messages.
+
+## Origin socket exclusion (2026-10-27)
+
+Connections now receive process-scoped unique socket IDs. In-memory packets
+retain the origin, and self-addressed peer frames carry it for replay. Non-self
+peer frames omit the metadata because their destination cannot be the origin
+socket. IDs are allocated once per connection and do not retain the client
+object through replay histories.
+
+Full race tests, vet, and the static build passed. Regression tests cover fanout
+including self and a remote node, spoofed client socket IDs, sibling sockets,
+status feedback, peer replay, reconnection, complete node-state recreation, and
+self-send with no other eligible connection.
+
+One four-CPU five-router stress run delivered all 999,000 data packets and
+999,000 success replies in 7.349 seconds, with 99.4 MiB idle heap and 7,693.2 MiB
+allocated during traffic. This is a regression/load check, not a new performance
+baseline. The origin field adds packet/history bookkeeping; it is not a free
+allocation optimization. The all-to-all workload excludes self, so the dedicated
+integration tests above exercise the new exclusion behavior.

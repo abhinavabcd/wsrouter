@@ -77,7 +77,7 @@ items:
             type: RuntimeDefault
         containers:
         - name: router
-          image: europe-central2-docker.pkg.dev/sukhiba-e4413/apps/wsrouter@sha256:ccafbd5727dd8b18698f5b3cbb298e85e5d4bce4d7e259ed38c0cabe40cced51
+          image: europe-central2-docker.pkg.dev/sukhiba-e4413/apps/wsrouter@sha256:568230b61c249a973bd623b3c904aaf788ab46ce0fd5e2c8d8057a10f44b78e0
           imagePullPolicy: IfNotPresent
           command:
           - /bin/sh
