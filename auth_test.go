@@ -26,7 +26,7 @@ func TestDomainAuthenticationLifecycle(t *testing.T) {
 			state := s.nodes[node.id]
 			state.mu.Lock()
 			for cl := range state.connections {
-				if cl.rp5 != 37 || cl.xSrcID != "account" || cl.nodeType != "node" {
+				if state.rp5 != 37 || cl.xSrcID != "account" || cl.nodeType != "node" {
 					t.Error("verifier metadata not applied")
 				}
 			}

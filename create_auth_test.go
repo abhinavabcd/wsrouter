@@ -16,13 +16,15 @@ func TestCreateRequiresVerifierApproval(t *testing.T) {
 		status     int
 		allowed    bool
 	}{
-		{"boolean", `{"valid":true,"rp5":10}`, 200, true},
-		{"string", `{"valid":"true","rp5":10}`, 200, true},
+		{"matched", `{"verified":"$NODE","rp5":10}`, 200, true},
+		{"legacy-boolean", `{"valid":true,"rp5":10}`, 200, false},
+		{"wrong-node", `{"verified":"other","rp5":10}`, 200, false},
+		{"legacy-string", `{"valid":"true","rp5":10}`, 200, false},
 		{"denied", `{"valid":false,"rp5":10}`, 200, false},
-		{"missing-rate", `{"valid":true}`, 200, false},
-		{"bad-rate", `{"valid":true,"rp5":0}`, 200, false},
-		{"bad-maxc", `{"valid":true,"rp5":10,"maxc":0}`, 200, false},
-		{"expired", `{"valid":true,"rp5":10,"expires":1}`, 200, false},
+		{"missing-rate", `{"verified":"$NODE"}`, 200, false},
+		{"bad-rate", `{"verified":"$NODE","rp5":0}`, 200, false},
+		{"bad-maxc", `{"verified":"$NODE","rp5":10,"maxc":0}`, 200, false},
+		{"expired", `{"verified":"$NODE","rp5":10,"expires":1}`, 200, false},
 		{"plain-ok", `ok`, 200, false},
 		{"malformed", `{`, 200, false},
 		{"unavailable", `{"valid":true,"rp5":10}`, 503, false},
@@ -47,7 +49,7 @@ func TestCreateRequiresVerifierApproval(t *testing.T) {
 					w.Header().Set("Location", "/must-not-follow")
 				}
 				w.WriteHeader(tc.status)
-				io.WriteString(w, tc.body)
+				io.WriteString(w, strings.ReplaceAll(tc.body, "$NODE", credentials.NodeID))
 			}))
 			verifier.TLS = router.TLS.Clone()
 			verifier.StartTLS()

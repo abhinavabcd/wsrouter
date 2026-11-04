@@ -103,7 +103,7 @@ func TestMain(m *testing.M) {
 			http.Error(w, "denied", 401)
 			return
 		}
-		approval := map[string]any{"valid": "true", "rp5": account.rate, "x_src_id": account.source, "expires": account.expires}
+		approval := map[string]any{"verified": account.nodeID, "rp5": account.rate, "x_src_id": account.source, "expires": account.expires}
 		if account.maxc != 0 {
 			approval["maxc"] = account.maxc
 		}

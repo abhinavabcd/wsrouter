@@ -54,7 +54,7 @@ func TestFanoutSkipsOnlyOriginSocket(t *testing.T) {
 		return p
 	}
 	// A client cannot spoof the internal origin to suppress another socket.
-	if err := first.WriteJSON(map[string]any{"_id": "fanout", "type": "data", "dest_node_ids": []string{a.id, b.id}, "src_socket_id": sibling.socketID}); err != nil {
+	if err := first.WriteJSON(map[string]any{"payload": "", "_id": "fanout", "type": "data", "dest_node_ids": []string{a.id, b.id}, "src_socket_id": sibling.socketID}); err != nil {
 		t.Fatal(err)
 	}
 	outcomes := map[string]bool{}

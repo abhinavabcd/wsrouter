@@ -14,9 +14,9 @@ The cluster is in Poland (`europe-central2`); `nl` in the hostname is only a nam
 | StatefulSet / pod | `wsrouter-0` / `wsrouter-0-0` |
 | Service ClusterIP | `10.112.15.40` |
 | Certificate PVC | `letsencrypt-wsrouter-0-0` (1 GiB) |
-| Image tag | `europe-central2-docker.pkg.dev/sukhiba-e4413/apps/wsrouter:20261027T135236Z` |
+| Image tag | `europe-central2-docker.pkg.dev/sukhiba-e4413/apps/wsrouter:20261027T150104Z` |
 | Go builder | `golang:1.27.3-trixie` |
-| Deployed digest | `sha256:568230b61c249a973bd623b3c904aaf788ab46ce0fd5e2c8d8057a10f44b78e0` |
+| Deployed digest | `sha256:35cedbebab57300a72130404ffcbdb3479d9e39ac22c88055ba25d29196489aa` |
 
 Run the commands below from this directory, using the context above.
 

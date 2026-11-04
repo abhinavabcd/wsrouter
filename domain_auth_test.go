@@ -21,9 +21,9 @@ func TestDomainCredentialHTTPSVerification(t *testing.T) {
 			return
 		}
 		if r.URL.Query().Get("action") == "renew" {
-			io.WriteString(w, `{"valid":true,"x_src_id":"account-42","rp5":25,"maxc":2,"secret_string":"rotated"}`)
+			json.NewEncoder(w).Encode(map[string]any{"verified": nodeID, "x_src_id": "account-42", "rp5": 25, "maxc": 2, "secret_string": "rotated"})
 		} else {
-			io.WriteString(w, `{"valid":"true","rp5":10}`)
+			json.NewEncoder(w).Encode(map[string]any{"verified": nodeID, "rp5": 10})
 		}
 	}))
 	defer backend.Close()
@@ -45,8 +45,10 @@ func TestDomainCredentialHTTPSVerification(t *testing.T) {
 }
 
 func TestDomainCredentialDenials(t *testing.T) {
-	for _, body := range []string{`{"valid":true,"rp5":10,"maxc":0}`, `{"valid":true,"rp5":10,"maxc":-1}`, `{"valid":true,"rp5":10,"maxc":"2"}`, "ok", "denied", "okay", `{"valid":false,"rp5":10}`, `{"valid":"false","rp5":10}`, `{"valid":"true","rp5":0}`, `{"valid":true}`, `{"valid":"true","rp5":10,"expires":1}`, strings.Repeat("x", 8193)} {
-		backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, body) }))
+	for _, body := range []string{`{"verified":"$NODE","rp5":10,"maxc":0}`, `{"verified":"$NODE","rp5":10,"maxc":-1}`, `{"verified":"$NODE","rp5":10,"maxc":"2"}`, "ok", "denied", "okay", `{"valid":false,"rp5":10}`, `{"valid":"false","rp5":10}`, `{"verified":"$NODE","rp5":0}`, `{"verified":"$NODE"}`, `{"verified":"$NODE","rp5":10,"expires":1}`, strings.Repeat("x", 8193)} {
+		backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			io.WriteString(w, strings.ReplaceAll(body, "$NODE", r.URL.Query().Get("node_id")))
+		}))
 		s := &server{addr: "https://router.example", httpClient: backend.Client()}
 		_, err := s.authenticate(context.Background(), strings.TrimPrefix(backend.URL, "https://")+"|id", "/verify|secret", "", "")
 		backend.Close()

@@ -142,7 +142,7 @@ func FuzzPacketEnvelope(f *testing.F) {
 		if err != nil || !p.validRoute() {
 			return
 		}
-		cl := client{rp5: math.MaxInt64}
+		cl := client{state: &nodeState{rp5: math.MaxInt64}}
 		cl.admit(p, 1700000010000)
 		encoded, err := encodePacket(p)
 		if err != nil {
@@ -185,5 +185,17 @@ func TestNormalCloseDuringFragmentDoesNotEnableReplay(t *testing.T) {
 	waitConnections(t, servers[0], node.id, 0)
 	if !cl.normalClose.Load() {
 		t.Fatal("fragmented normal close treated as unexpected disconnect")
+	}
+}
+
+func TestRequiredPacketPayload(t *testing.T) {
+	for _, raw := range []string{`{"type":"text","dest_node_id":"dest"}`, `{"type":"text","dest_node_id":"dest","payload":null}`, `{"type":"text","dest_node_id":"dest","payload":1}`} {
+		if _, err := decodePacket([]byte(raw)); err == nil {
+			t.Fatalf("invalid payload accepted: %s", raw)
+		}
+	}
+	p, err := decodePacket([]byte(`{"type":"text","dest_node_id":"dest","payload":""}`))
+	if err != nil || !p.validRoute() {
+		t.Fatalf("empty payload rejected: %v", err)
 	}
 }

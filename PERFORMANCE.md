@@ -182,3 +182,31 @@ allocated during traffic. This is a regression/load check, not a new performance
 baseline. The origin field adds packet/history bookkeeping; it is not a free
 allocation optimization. The all-to-all workload excludes self, so the dedicated
 integration tests above exercise the new exclusion behavior.
+
+
+## Shared node quotas and delayed cleanup (2026-11-04)
+
+Historical measurement: this comparison predates removal of HTTP sending. The
+current router retains shared WebSocket quotas and delayed node cleanup.
+
+Three runs each before and after, using `golang:1.27.3-trixie`, Docker limited
+to four CPUs / 6 GiB, and `GOMAXPROCS=4`. Baseline is the stateless HTTP-token
+implementation before shared node quotas. Workloads ran serially on each version.
+
+| Workload | Before | After | Median change |
+| --- | --- | --- | --- |
+| Five servers, 1,000 nodes; 999,000 data + 999,000 success packets | 7.474 / 7.530 / 7.402 s | 7.452 / 7.319 / 7.290 s | 7.474 → 7.319 s (−2.1%) |
+| 64 WebSockets sharing one source node; 1,024 data + 65,536 feedback deliveries | 75.1 / 81.4 / 139.7 ms | 81.5 / 88.2 / 85.0 ms | 81.4 → 85.0 ms (+4.4%) |
+
+The ranges overlap; these short runs do not establish a speedup or regression.
+Five-server median allocated bytes were 7,755.2 MiB before and 7,769.6 MiB after
+(+0.2%). The shared-source test uses a high allowance to measure lock contention
+and delivery, while separate concurrent HTTP/WebSocket admission tests enforce
+an exact shared quota. Fanout is charged once. Rate updates retain counters and
+cached tokens cannot overwrite an existing node's policy.
+
+Validation: full race suite, `go vet`, static build, cleanup extension/identity-race
+and wake tests, shared quota and reconnect tests. Cleanup uses one reusable timer
+and one pending heap entry per socketless node, rather than per-node timers or a
+full node scan. Logs: `/tmp/wsrouter-shared-before.log`,
+`/tmp/wsrouter-shared-after.log`, `/tmp/wsrouter-shared-race.log`.

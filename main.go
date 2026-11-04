@@ -91,6 +91,11 @@ type receiptQueue struct {
 }
 
 type nodeState struct {
+	nodeID                     string
+	rp5, rateBucket, rateCount int64
+	cleanupAt                  time.Time
+	cleanupCheckPending        bool
+
 	nextConnection uint64
 	mu             sync.Mutex
 	connections    map[*client]struct{}
@@ -119,9 +124,6 @@ type client struct {
 	xSrcID          string
 	nodeType        string
 	keepAlive       time.Duration
-	rp5             int64
-	rateBucket      int64 // readLoop owns the per-connection bucket and counter
-	rateCount       int64
 	sent            []replayRecord // guarded by state.mu
 	sentHead        int
 	normalClose     atomic.Bool
@@ -135,6 +137,10 @@ type client struct {
 }
 
 type server struct {
+	cleanupMu    sync.Mutex
+	cleanupQueue nodeCleanupHeap
+	cleanupWake  chan struct{}
+
 	id           uint64
 	addr         string
 	clusterAddr  string
@@ -324,6 +330,7 @@ func newServer(id uint64, addr, clusterAddr string) *server {
 	if _, err := rand.Read(secret); err != nil {
 		panic(err)
 	}
+	s.cleanupWake = make(chan struct{}, 1)
 	s.serverToken = "/server|" + hex.EncodeToString(secret)
 	s.serverNodeID = strings.TrimPrefix(addr, "https://") + "|" + strconv.FormatUint(id, 10)
 	if s.leader {
@@ -521,6 +528,17 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) error {
 	return json.NewEncoder(w).Encode(result)
 }
 
+// Caller holds s.mu; the returned node is locked.
+func (s *server) lockNode(nodeID string, rp5 int64) *nodeState {
+	state := s.nodes[nodeID]
+	if state == nil {
+		state = &nodeState{nodeID: nodeID, rp5: rp5, connections: make(map[*client]struct{})}
+		s.nodes[nodeID] = state
+	}
+	state.mu.Lock()
+	return state
+}
+
 func (s *server) renew(w http.ResponseWriter, r *http.Request) error {
 	nodeID, token := requestIdentity(r)
 	c, err := s.authenticate(r.Context(), nodeID, token, "renew", r.Header.Get("Origin"))
@@ -541,8 +559,11 @@ func (s *server) disconnectNode(nodeID string) {
 			cl.normalClose.Store(true)
 			connections = append(connections, cl)
 		}
-		delete(s.nodes, nodeID)
-		s.nodeCount.Add(-1)
+		if len(state.connections) != 0 {
+			s.nodeCount.Add(-1)
+		}
+		clear(state.connections)
+		s.scheduleNodeCleanup(state, time.Now().Add(10*time.Second))
 		state.mu.Unlock()
 	}
 	s.mu.Unlock()
@@ -602,16 +623,14 @@ func (s *server) connect(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return nil
 	}
-	cl := &client{socketID: s.packetPrefix + "s" + strconv.FormatUint(s.nextPacketID.Add(1), 36), pingIndex: -1, ping: make(chan struct{}, 1), conn: conn, nodeID: c.NodeID, xSrcID: c.XSrcID, nodeType: c.NodeType, rp5: c.RP5, keepAlive: keepAlive, send: make(chan outbound, 1024), done: make(chan struct{}), server: s}
+	cl := &client{socketID: s.packetPrefix + "s" + strconv.FormatUint(s.nextPacketID.Add(1), 36), pingIndex: -1, ping: make(chan struct{}, 1), conn: conn, nodeID: c.NodeID, xSrcID: c.XSrcID, nodeType: c.NodeType, keepAlive: keepAlive, send: make(chan outbound, 1024), done: make(chan struct{}), server: s}
 	var evicted []*client
 	s.mu.Lock()
-	state := s.nodes[c.NodeID]
-	if state == nil {
-		state = &nodeState{connections: make(map[*client]struct{})}
-		s.nodes[c.NodeID] = state
+	state := s.lockNode(c.NodeID, c.RP5)
+	state.rp5 = c.RP5
+	if len(state.connections) == 0 {
 		s.nodeCount.Add(1)
 	}
-	state.mu.Lock()
 	for len(state.connections) >= c.MaxC {
 		var oldest *client
 		for existing := range state.connections {
@@ -672,7 +691,7 @@ func (s *server) registerServer(w http.ResponseWriter, r *http.Request) error {
 			return httpStatus(401)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		return json.NewEncoder(w).Encode(map[string]any{"valid": true, "rp5": 10})
+		return json.NewEncoder(w).Encode(map[string]any{"verified": s.serverNodeID, "rp5": 10})
 	}
 	if !s.leader {
 		return httpStatus(404)
@@ -1163,24 +1182,9 @@ func (cl *client) readLoop() {
 		if err != nil || !p.validRoute() {
 			return
 		}
-		if cl.nodeType == "server" {
-			if p.sourceNodeID() == "" {
-				return
-			}
-		} else {
-			if p.Type == "status" || p.Src != "" || p.XSrc != "" {
-				return
-			}
-			p.Src, p.XSrc = cl.nodeID, cl.xSrcID
-			p.SrcNodeID = cl.nodeID
-		}
-		p.srcSocketID = cl.socketID
 		now := time.Now().UnixMilli()
-		if p.Timestamp == nil {
-			p.Timestamp = &now
-		}
-		if p.PacketID == "" {
-			p.PacketID = cl.server.packetPrefix + strconv.FormatUint(cl.server.nextPacketID.Add(1), 36)
+		if !cl.prepare(&p, now) {
+			return
 		}
 		if reason := cl.admit(p, now); reason != "" {
 			cl.drop(p, data, reason)
@@ -1200,18 +1204,46 @@ func (cl *client) readLoop() {
 	}
 }
 
+func (cl *client) prepare(p *packet, now int64) bool {
+	if cl.nodeType == "server" {
+		if p.sourceNodeID() == "" {
+			return false
+		}
+	} else {
+		if p.Type == "status" || p.Src != "" || p.XSrc != "" {
+			return false
+		}
+		p.Src, p.SrcNodeID, p.XSrc = cl.nodeID, cl.nodeID, cl.xSrcID
+	}
+	p.srcSocketID = cl.socketID
+	if p.Timestamp == nil {
+		p.Timestamp = &now
+	}
+	if p.PacketID == "" {
+		p.PacketID = cl.server.packetPrefix + strconv.FormatUint(cl.server.nextPacketID.Add(1), 36)
+	}
+	return true
+}
+
 func (cl *client) admit(p packet, now int64) string {
 	if cl.nodeType == "server" {
 		return ""
 	}
+	cl.state.mu.Lock()
+	defer cl.state.mu.Unlock()
+	return cl.state.admit(p, now)
+}
+
+// Caller holds the node lock. Older concurrent arrivals cannot reset a newer bucket.
+func (state *nodeState) admit(p packet, now int64) string {
 	bucket := now / 5000
-	if bucket != cl.rateBucket {
-		cl.rateBucket, cl.rateCount = bucket, 0
+	if bucket > state.rateBucket {
+		state.rateBucket, state.rateCount = bucket, 0
 	}
-	if cl.rateCount >= cl.rp5 {
+	if state.rateCount >= state.rp5 {
 		return "rate_limited"
 	}
-	cl.rateCount++
+	state.rateCount++
 	if p.Timestamp != nil && (*p.Timestamp < now-8000 || *p.Timestamp > now) {
 		return "invalid_time"
 	}
@@ -1238,6 +1270,7 @@ func (cl *client) drop(p packet, original []byte, reason string) {
 func (s *server) startRouting() {
 	s.routingOnce.Do(func() {
 		go s.heartbeatLoop()
+		go s.nodeCleanupLoop()
 		s.routingQueues = make([]chan *routedPacket, min(runtime.GOMAXPROCS(0), 8))
 		for i := range s.routingQueues {
 			q := make(chan *routedPacket, 131072)
@@ -1283,6 +1316,106 @@ func (s *server) submit(p packet, source *client) bool {
 		source.pendingBytes.Add(-size)
 	}
 	return false
+}
+
+type nodeCleanupEntry struct {
+	node          *nodeState
+	scheduledTime time.Time
+}
+type nodeCleanupHeap []nodeCleanupEntry
+
+func (h nodeCleanupHeap) Len() int           { return len(h) }
+func (h nodeCleanupHeap) Less(i, j int) bool { return h[i].scheduledTime.Before(h[j].scheduledTime) }
+func (h nodeCleanupHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *nodeCleanupHeap) Push(v any)        { *h = append(*h, v.(nodeCleanupEntry)) }
+func (h *nodeCleanupHeap) Pop() any {
+	last := len(*h) - 1
+	v := (*h)[last]
+	(*h)[last] = nodeCleanupEntry{}
+	*h = (*h)[:last]
+	return v
+}
+
+func (s *server) enqueueNodeCleanup(state *nodeState) {
+	s.cleanupMu.Lock()
+	earlier := len(s.cleanupQueue) == 0 || state.cleanupAt.Before(s.cleanupQueue[0].scheduledTime)
+	heap.Push(&s.cleanupQueue, nodeCleanupEntry{state, state.cleanupAt})
+	s.cleanupMu.Unlock()
+	if earlier {
+		select {
+		case s.cleanupWake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// Caller holds map then node locks; activity extends only the deadline of a pending check.
+func (s *server) scheduleNodeCleanup(state *nodeState, deadline time.Time) {
+	if deadline.After(state.cleanupAt) {
+		state.cleanupAt = deadline
+	}
+	if len(state.connections) == 0 && !state.cleanupCheckPending {
+		state.cleanupCheckPending = true
+		s.enqueueNodeCleanup(state)
+	}
+}
+
+func (s *server) cleanupNodes(now time.Time) {
+	for {
+		s.cleanupMu.Lock()
+		if len(s.cleanupQueue) == 0 || s.cleanupQueue[0].scheduledTime.After(now) {
+			s.cleanupMu.Unlock()
+			return
+		}
+		entry := heap.Pop(&s.cleanupQueue).(nodeCleanupEntry)
+		s.cleanupMu.Unlock()
+		// Never hold the heap lock while acquiring the map or node lock.
+		s.mu.Lock()
+		state := entry.node
+		state.mu.Lock()
+		switch {
+		case s.nodes[state.nodeID] != state || len(state.connections) != 0:
+			state.cleanupCheckPending = false
+		case state.cleanupAt.After(now):
+			s.enqueueNodeCleanup(state)
+		default:
+			delete(s.nodes, state.nodeID)
+			state.cleanupCheckPending = false
+		}
+		state.mu.Unlock()
+		s.mu.Unlock()
+	}
+}
+
+func (s *server) nodeCleanupLoop() {
+	timer := time.NewTimer(time.Hour)
+	defer timer.Stop()
+	for {
+		s.cleanupNodes(time.Now())
+		s.cleanupMu.Lock()
+		var next time.Time
+		if len(s.cleanupQueue) != 0 {
+			next = s.cleanupQueue[0].scheduledTime
+		}
+		s.cleanupMu.Unlock()
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		var tick <-chan time.Time
+		if !next.IsZero() {
+			timer.Reset(max(0, min(time.Until(next), 60*time.Second)))
+			tick = timer.C
+		}
+		select {
+		case <-s.routingDone:
+			return
+		case <-s.cleanupWake:
+		case <-tick:
+		}
+	}
 }
 
 // One timer per server schedules all client pings. Socket writes stay in writeLoop.
@@ -1410,6 +1543,7 @@ func (cl *client) close() {
 		s.mu.Lock()
 		state := cl.state
 		state.mu.Lock()
+		_, tracked := state.connections[cl]
 		delete(state.connections, cl)
 		cl.sent, cl.sentHead = pruneHistory(cl.sent, cl.sentHead, time.Now().Add(-cl.keepAlive))
 		if !cl.normalClose.Load() {
@@ -1419,12 +1553,13 @@ func (cl *client) close() {
 		cl.sentHead = 0
 		s.recentClients.Delete(cl)
 		if len(state.connections) == 0 {
-			if s.nodes[cl.nodeID] == state {
-				delete(s.nodes, cl.nodeID)
+			if s.nodes[cl.nodeID] == state && tracked {
 				s.nodeCount.Add(-1)
+				s.scheduleNodeCleanup(state, time.Now().Add(10*time.Second))
 			}
 			state.recent.prune(time.Now())
 			recent = append([]receipt(nil), state.recent.entries[state.recent.head:]...)
+			state.recent = receiptQueue{}
 			s.recent.CompareAndDelete(cl.nodeID, state)
 		}
 		state.mu.Unlock()
@@ -1492,7 +1627,17 @@ func decodePacket(data []byte) (packet, error) {
 	if !utf8.Valid(data) {
 		return p, errors.New("invalid UTF-8")
 	}
-	err := json.Unmarshal(data, &p)
+	wire := struct {
+		*packet
+		Payload *string `json:"payload"`
+	}{packet: &p}
+	err := json.Unmarshal(data, &wire)
+	if err == nil && wire.Payload == nil {
+		err = errors.New("missing payload")
+	}
+	if wire.Payload != nil {
+		p.Payload = *wire.Payload
+	}
 	return p, err
 }
 
@@ -1679,15 +1824,15 @@ func (s *server) authenticate(ctx context.Context, nodeID, token, action, origin
 	}
 	{
 		var approval struct {
-			Valid   json.RawMessage `json:"valid"`
-			XSrcID  string          `json:"x_src_id"`
-			RP5     int64           `json:"rp5"`
-			MaxC    int             `json:"maxc"`
-			Expires int64           `json:"expires"`
-			Secret  string          `json:"secret_string"`
+			Verified string `json:"verified"`
+			XSrcID   string `json:"x_src_id"`
+			RP5      int64  `json:"rp5"`
+			MaxC     int    `json:"maxc"`
+			Expires  int64  `json:"expires"`
+			Secret   string `json:"secret_string"`
 		}
 		approval.MaxC = 5
-		if json.Unmarshal(body, &approval) != nil || (string(approval.Valid) != `"true"` && string(approval.Valid) != "true") || approval.RP5 <= 0 || approval.MaxC <= 0 || len(approval.XSrcID) > 256 || approval.Expires < 0 || (approval.Expires != 0 && approval.Expires <= time.Now().Unix()) {
+		if json.Unmarshal(body, &approval) != nil || approval.Verified != nodeID || approval.RP5 <= 0 || approval.MaxC <= 0 || len(approval.XSrcID) > 256 || approval.Expires < 0 || (approval.Expires != 0 && approval.Expires <= time.Now().Unix()) {
 			return c, errors.New("authorization denied")
 		}
 		if approval.XSrcID != "" {

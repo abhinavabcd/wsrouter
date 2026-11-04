@@ -30,10 +30,10 @@ The JSON body contains `node_id` and `secret`. The node ID is also retained in t
 Approval requires HTTP 200 and JSON:
 
 ```json
-{"valid":"true","rp5":10,"maxc":5}
+{"verified":"auth.example.com|NODE_RANDOM_ID","rp5":10,"maxc":5}
 ```
 
-Boolean `true` is also accepted. `maxc` is an optional positive integer, defaulting to 5, that limits tracked `/connect` sockets per node. A new connection evicts and closes the oldest tracked socket when the limit is reached. A lowered limit evicts as many oldest sockets as needed before tracking the new one. Eviction is an intentional close and does not replay recent packets. `rp5` must be a positive integer and becomes the connection's allowance per five-second bucket. Plain `ok`, false or missing validity, missing or invalid rates, redirects, certificate failures, and timeouts deny authentication. Requests have a five-second timeout and responses are limited to 8 KiB.
+`verified` must exactly equal the requested `node_id`. Legacy `valid` responses are rejected. `maxc` is an optional positive integer, defaulting to 5, that limits tracked `/connect` sockets per node. A new connection evicts and closes the oldest tracked socket when the limit is reached. A lowered limit evicts as many oldest sockets as needed before tracking the new one. Eviction is an intentional close and does not replay recent packets. `rp5` must be a positive integer and becomes the node's shared allowance per five-second bucket across all its WebSockets. Plain `ok`, missing or mismatched `verified`, missing or invalid rates, redirects, certificate failures, and timeouts deny authentication. Requests have a five-second timeout and responses are limited to 8 KiB.
 
 The verifier also supports optional `x_src_id` and `expires` (Unix seconds) from the authority. Without them, source identity defaults to `node_id`, and validity is decided by the authority at each authentication. Renewal can return `secret_string` to rotate the token; otherwise it approves the existing token. The router cannot independently mint a new secret that an external authority will recognize.
 

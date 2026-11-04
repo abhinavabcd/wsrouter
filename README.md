@@ -42,14 +42,14 @@ Content-Type: application/json
 The verifier must return HTTP 200 with JSON:
 
 ```json
-{"valid":"true","rp5":10,"maxc":5}
+{"verified":"auth.example.com|NODE_RANDOM_ID","rp5":10,"maxc":5}
 ```
 
-Boolean `true` is also accepted. `maxc` is an optional positive integer, defaulting to 5, that limits tracked `/connect` sockets per node. A new connection evicts and closes the oldest tracked socket when the limit is reached. A lowered limit evicts as many oldest sockets as needed before tracking the new one. Eviction is an intentional close and does not replay recent packets. `rp5` is required and must be a positive integer. Plain `ok`, false/missing validity, invalid rates, redirects, certificate failures, and timeouts deny authentication. Verification has a five-second timeout and an 8 KiB response limit. The `node_id` query parameter always comes from the requested identity, replacing any existing values. Other query parameters are preserved, except `action`, which is controlled by the router.
+`verified` must exactly equal the requested `node_id`. Legacy `valid` responses are rejected. `maxc` is an optional positive integer, defaulting to 5, that limits tracked `/connect` sockets per node. A new connection evicts and closes the oldest tracked socket when the limit is reached. A lowered limit evicts as many oldest sockets as needed before tracking the new one. Eviction is an intentional close and does not replay recent packets. `rp5` is required and must be a positive integer. Plain `ok`, missing or mismatched `verified`, invalid rates, redirects, certificate failures, and timeouts deny authentication. Verification has a five-second timeout and an 8 KiB response limit. The `node_id` query parameter always comes from the requested identity, replacing any existing values. Other query parameters are preserved, except `action`, which is controlled by the router.
 
 The verifier can additionally return `x_src_id` and `expires` (Unix seconds). Without them, `x_src_id` defaults to the node ID and validity is decided by the authority on each authentication. A returned expiry must be in the future. `/create` no longer accepts trusted identity, rate, or lifetime claims from the caller: the authority supplies them. Old HMAC tokens are incompatible with this protocol.
 
-`GET /locate` takes the same credentials, verifies them, and returns the ring owner's `address`. `/connect` returns HTTP 421 and `{"address":"https://owner:port"}` if the node belongs elsewhere. Browser WebSocket APIs cannot read that response body, so browser clients should use `/locate` before connecting. WebSocket origins from any domain are accepted. `/create` and `/connect` (along with the other HTTP endpoints) return `Access-Control-Allow-Origin: *` and answer CORS preflight requests. If an incoming request includes `Origin`, the router forwards it unchanged as the `Origin` header on its HTTPS verification request, including lookup and renewal. The authority can approve or deny that origin through its usual `valid` response. Requests without `Origin` leave it absent. `/create` also forwards Origin and checks approval before returning credentials.
+`GET /locate` takes the same credentials, verifies them, and returns the ring owner's `address`. `/connect` returns HTTP 421 and `{"address":"https://owner:port"}` if the node belongs elsewhere. Browser WebSocket APIs cannot read that response body, so browser clients should use `/locate` before connecting. WebSocket origins from any domain are accepted. `/create` and `/connect` (along with the other HTTP endpoints) return `Access-Control-Allow-Origin: *` and answer CORS preflight requests. If an incoming request includes `Origin`, the router forwards it unchanged as the `Origin` header on its HTTPS verification request, including lookup and renewal. The authority can approve or deny that origin through its `verified` response. Requests without `Origin` leave it absent. `/create` also forwards Origin and checks approval before returning credentials.
 
 ## Renewal
 
@@ -93,7 +93,7 @@ optional metadata; replay through an older peer cannot preserve this exclusion.
 
 Regular nodes may provide an integer Unix millisecond `timestamp` between the server's receive time minus 8,000 milliseconds and its current time, inclusive. A missing/null timestamp is filled by the server. An invalid time produces `type: "drop", payload: "invalid_time"`, with the other input fields copied. Server nodes preserve supplied timestamps without drift checks. Replay preserves the original ID and timestamp.
 
-The authority's `rp5` limits each regular connection using fixed server-time buckets (`UnixMilli / 5000`). One incoming packet consumes one allowance, including invalid timestamps and fanout requests. Excess traffic gets `type: "drop", payload: "rate_limited"`. Dropped packets are returned only to that socket and are not routed. Server nodes bypass these limits.
+The authority's `rp5` limits each regular node across all its WebSockets using shared fixed server-time buckets (`UnixMilli / 5000`). One incoming packet consumes one allowance, including invalid timestamps and fanout requests. Excess traffic gets `type: "drop", payload: "rate_limited"`. Dropped packets are returned only to that socket and are not routed. Server nodes bypass these limits.
 
 Delivery feedback uses the same ring:
 
@@ -116,7 +116,7 @@ cannot replace a live ring. `/create` and `/refresh` require one complete JSON
 value, rejecting trailing data.
 
 Blocking/unblocking is client-owned: those type names have no special router
-behavior. `rp5` remains per connection and per incoming packet; fanout consumes
+behavior. `rp5` is shared per node and counts each incoming packet once; fanout consumes
 one allowance, not one per destination. Queue byte caps remain in effect.
 
 Packets are limited to 1 MiB. Each client has a 1,024-packet send queue capped at 4 MiB. Incoming fanout is expanded into bounded shared routing queues: 4 MiB of pending work per source connection and 128 MiB per server. Routing uses up to eight workers, chosen from `GOMAXPROCS`, and consistently assigns a destination node to a worker. Connection lifecycle and replay cleanup retain their locks. Slow/full client queues close the socket; a full peer queue returns a routing failure instead of blocking a worker.
@@ -154,3 +154,16 @@ Malformed-input regressions cover JSON syntax/type errors, null envelopes,
 oversized IDs and messages, invalid UTF-8, deep nesting, bad fanout, peer
 metadata/batches, and normal closure during a fragmented message. Run the bounded
 parser fuzz test with `go test -run '^$' -fuzz FuzzPacketEnvelope -fuzztime=30s .`.
+
+## Node state retention
+
+Successful WebSocket authentication updates the shared node's `rp5` without
+resetting its bucket counters. All sockets for that node share the allowance;
+fanout consumes one allowance. Server connections retain their admission bypass.
+
+The last WebSocket close retains node state for at least 10 seconds. Reconnecting
+during retention reuses its counters. Socketless state is excluded from connected
+node counts and is unavailable for delivery. A single cleanup goroutine uses a
+min-heap, one reusable timer, and a buffered wake channel. Each socketless node has
+at most one pending check; later closes extend its deadline. Cleanup retains active
+nodes and rechecks object identity before deleting expired state.

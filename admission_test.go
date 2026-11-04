@@ -26,7 +26,7 @@ func TestAdmissionTimestampBounds(t *testing.T) {
 		{"maximum", 1<<63 - 1, "invalid_time"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cl := &client{rp5: 10}
+			cl := &client{state: &nodeState{rp5: 10}}
 			if got := cl.admit(packet{Timestamp: &tc.time}, now); got != tc.want {
 				t.Fatalf("admit = %q, want %q", got, tc.want)
 			}
@@ -35,7 +35,7 @@ func TestAdmissionTimestampBounds(t *testing.T) {
 }
 
 func TestAdmissionBucketsAndServerBypass(t *testing.T) {
-	cl := &client{rp5: 2}
+	cl := &client{state: &nodeState{rp5: 2}}
 	for _, tc := range []struct {
 		now  int64
 		want string
@@ -47,25 +47,25 @@ func TestAdmissionBucketsAndServerBypass(t *testing.T) {
 			t.Fatalf("bucket admission at %d = %q, want %q", tc.now, got, tc.want)
 		}
 	}
-	other := &client{rp5: 2}
+	other := &client{state: &nodeState{rp5: 2}}
 	if got := other.admit(packet{}, 15002); got != "" {
-		t.Fatal("one connection consumed another connection's allowance")
+		t.Fatal("one node consumed another node's allowance")
 	}
 	badTime := int64(20001)
-	cl = &client{rp5: 1}
+	cl = &client{state: &nodeState{rp5: 1}}
 	if got := cl.admit(packet{Timestamp: &badTime}, 20000); got != "invalid_time" {
 		t.Fatalf("future timestamp: %s", got)
 	}
 	if got := cl.admit(packet{}, 20000); got != "rate_limited" {
 		t.Fatal("invalid timestamp did not consume its bucket allowance")
 	}
-	serverConn := &client{nodeType: "server", rp5: 1}
+	serverConn := &client{nodeType: "server", state: &nodeState{rp5: 1}}
 	for range 100 {
 		if got := serverConn.admit(packet{Timestamp: &badTime}, 10000); got != "" {
 			t.Fatalf("server was subject to node admission: %s", got)
 		}
 	}
-	if serverConn.rateCount != 0 {
+	if serverConn.state.rateCount != 0 {
 		t.Fatal("server traffic changed the node rate counter")
 	}
 }
@@ -130,7 +130,7 @@ func TestInvalidTimeDropPreservesFieldsAndSocket(t *testing.T) {
 	}
 }
 
-func TestRateDropIsPerConnection(t *testing.T) {
+func TestRateDropIsSharedBetweenConnections(t *testing.T) {
 	servers, urls := startCluster(t, 1)
 	source := createNode(t, urls[0].URL, "source", 1)
 	dest := createNode(t, urls[0].URL, "dest")
@@ -177,22 +177,19 @@ func TestRateDropIsPerConnection(t *testing.T) {
 	if err := second.WriteMessage(websocket.TextMessage, data); err != nil {
 		t.Fatal(err)
 	}
-	first.SetReadDeadline(time.Now().Add(time.Second))
-	_, raw, err := first.ReadMessage()
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := decodePacket(raw)
-	if err != nil || got.Type != "status" || got.Payload != "success" || got.PacketID != "independent" {
-		t.Fatalf("rate allowance was shared between sockets: %+v, %v", got, err)
-	}
-	dst.SetReadDeadline(time.Now().Add(time.Second))
-	_, raw, err = dst.ReadMessage()
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err = decodePacket(raw)
-	if err != nil || got.PacketID != "independent" {
-		t.Fatalf("a rate-dropped packet reached the destination: %+v, %v", got, err)
+	// The second socket also received the earlier success feedback.
+	second.SetReadDeadline(time.Now().Add(time.Second))
+	for {
+		var got packet
+		if err := second.ReadJSON(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got.PacketID != "independent" {
+			continue
+		}
+		if got.Type != "drop" || got.Payload != "rate_limited" {
+			t.Fatalf("shared quota bypass: %+v", got)
+		}
+		break
 	}
 }

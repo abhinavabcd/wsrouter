@@ -16,7 +16,11 @@ func TestCORSAndVerifierOrigin(t *testing.T) {
 	verifier := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		origins <- origin
-		json.NewEncoder(w).Encode(map[string]any{"valid": origin != "https://denied.example", "rp5": 10})
+		verified := r.URL.Query().Get("node_id")
+		if origin == "https://denied.example" {
+			verified = ""
+		}
+		json.NewEncoder(w).Encode(map[string]any{"verified": verified, "rp5": 10})
 	}))
 	verifier.TLS = urls[0].TLS.Clone()
 	verifier.StartTLS()
