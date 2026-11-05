@@ -31,7 +31,7 @@ docker run --rm --mount "type=bind,source=$PWD,target=/src,readonly" \
     go test -race ./...
     go vet ./...
     if [ "$RUN_STRESS" = 1 ]; then
-        WSROUTER_STRESS=1 go test -run TestStressFiveServers -count=1 -v .
+        WSROUTER_STRESS=1 go test -run TestStressFiveServers -count=1 -v ./tests
     fi
     '
 

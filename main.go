@@ -1183,8 +1183,22 @@ func (cl *client) readLoop() {
 			return
 		}
 		now := time.Now().UnixMilli()
-		if !cl.prepare(&p, now) {
-			return
+		if cl.nodeType == "server" {
+			if p.sourceNodeID() == "" {
+				return
+			}
+		} else {
+			if p.Type == "status" || p.Src != "" || p.XSrc != "" {
+				return
+			}
+			p.Src, p.SrcNodeID, p.XSrc = cl.nodeID, cl.nodeID, cl.xSrcID
+		}
+		p.srcSocketID = cl.socketID
+		if p.Timestamp == nil {
+			p.Timestamp = &now
+		}
+		if p.PacketID == "" {
+			p.PacketID = cl.server.packetPrefix + strconv.FormatUint(cl.server.nextPacketID.Add(1), 36)
 		}
 		if reason := cl.admit(p, now); reason != "" {
 			cl.drop(p, data, reason)
@@ -1202,27 +1216,6 @@ func (cl *client) readLoop() {
 			}
 		}
 	}
-}
-
-func (cl *client) prepare(p *packet, now int64) bool {
-	if cl.nodeType == "server" {
-		if p.sourceNodeID() == "" {
-			return false
-		}
-	} else {
-		if p.Type == "status" || p.Src != "" || p.XSrc != "" {
-			return false
-		}
-		p.Src, p.SrcNodeID, p.XSrc = cl.nodeID, cl.nodeID, cl.xSrcID
-	}
-	p.srcSocketID = cl.socketID
-	if p.Timestamp == nil {
-		p.Timestamp = &now
-	}
-	if p.PacketID == "" {
-		p.PacketID = cl.server.packetPrefix + strconv.FormatUint(cl.server.nextPacketID.Add(1), 36)
-	}
-	return true
 }
 
 func (cl *client) admit(p packet, now int64) string {

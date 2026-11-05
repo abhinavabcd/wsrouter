@@ -13,10 +13,10 @@ docker run --rm --cpus="${CPUS:-4}" --memory="${MEMORY:-6g}" \
     go version
     i=0
     while [ "$i" -lt "$RUNS" ]; do
-        go test -run "^TestStressFiveServers$" -count=1 -v .
+        go test -run "^TestStressFiveServers$" -count=1 -v ./tests
         i=$((i+1))
     done
     if [ "$WSROUTER_STEADY" = 1 ]; then
-        go test -run "^TestStressSteadyRouting$" -count=1 -v .
+        go test -run "^TestStressSteadyRouting$" -count=1 -v ./tests
     fi
     '

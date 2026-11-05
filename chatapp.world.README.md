@@ -152,5 +152,4 @@ if retaining the ACME account and certificate history is required. Do not delete
 the namespace or PVCs during routine upgrades. Router connection state and
 recent replay queues are in memory; pod loss does not preserve those queues.
 
-For protocol and verifier configuration see [README.md](README.md) and
-[DOMAIN_AUTH.md](DOMAIN_AUTH.md).
+For protocol and verifier configuration see [architecture and protocol guide](architechure.html).

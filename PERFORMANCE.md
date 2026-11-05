@@ -210,3 +210,29 @@ and wake tests, shared quota and reconnect tests. Cleanup uses one reusable time
 and one pending heap entry per socketless node, rather than per-node timers or a
 full node scan. Logs: `/tmp/wsrouter-shared-before.log`,
 `/tmp/wsrouter-shared-after.log`, `/tmp/wsrouter-shared-race.log`.
+
+
+## Multi-server CPU review (2026-11-06)
+
+Profiled the five-server/1,000-node workload with four CPUs and GOMAXPROCS=4.
+This profile includes both routers and test clients: system calls accounted for
+24.2% flat CPU, memory copying 5.5%, and stacks containing SHA-256 or owner lookup
+2.7%. JSON handling, allocation and garbage collection also feature prominently.
+
+The queue hashes each destination to select a worker; routing hashes it again to
+find its ring owner. A candidate reused the first hash in an internal packet field.
+The isolated benchmark improved from median 175.9 ns / 128 bytes / 2 allocations
+to 87.08 ns / 64 bytes / 1 allocation. However, the enlarged packet increased full
+workload allocations from 7,788.1 MiB to 7,981.1 MiB. Profiled routing time was
+7.479s before and 7.702s after. These single runs do not establish a reliable timing
+regression, but the allocation increase defeats the intended improvement. Reverted
+the candidate; retained `tests/routing_bench_test.go` for future experiments.
+
+Caching a client's own hash on connection does not eliminate destination hashes
+for remote nodes. A global destination cache introduces synchronization, memory
+limits and eviction; caching owner addresses additionally requires invalidation
+on ring changes. Neither is justified by this profile alone. Investigate allocation
+and encoding costs before adding such caches. Production routing remains unchanged.
+Candidate validation passed race tests, vet, static build and five-server stress.
+Logs: `/tmp/wsrouter-cpu-before.log`, `/tmp/wsrouter-hash-profile.log`, and
+`/tmp/wsrouter-hash-reuse.log`.
