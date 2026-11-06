@@ -236,3 +236,36 @@ and encoding costs before adding such caches. Production routing remains unchang
 Candidate validation passed race tests, vet, static build and five-server stress.
 Logs: `/tmp/wsrouter-cpu-before.log`, `/tmp/wsrouter-hash-profile.log`, and
 `/tmp/wsrouter-hash-reuse.log`.
+
+## Packet copies and JSON work (2026-11-06)
+
+Removed a redundant canonical-packet JSON decode from drop feedback: parse the
+original fields once, remove canonical keys from the extras, and join the encoded
+extras with the encoded canonical packet. Raw extra values retain their precision.
+Disconnect cleanup now transfers the detached replay/receipt slices under their
+existing locks instead of cloning them. Peer receive and batch buffers over 64 KiB
+are released after use; repeated large packets can therefore allocate more often,
+but idle peer links no longer retain those large buffers indefinitely.
+
+Three microbenchmark runs, same four-CPU/6-GiB Docker setup and Go 1.27.3:
+
+| Drop feedback, 1 KiB input payload | Before median | After median |
+| --- | --- | --- |
+| Canonical fields only | 6,106 ns; 2,836 B; 42 allocations | 3,562 ns; 2,162 B; 14 allocations |
+| With extra JSON metadata | 7,181 ns; 3,733 B; 49 allocations | 4,427 ns; 2,547 B; 20 allocations |
+
+Healthy routing already serializes one delivery buffer for all sockets of a node.
+Peer forwarding still decodes the peer envelope and encodes the destination client
+packet. Avoiding this would require retaining wire bytes alongside parsed packets,
+adding memory and cache-invalidation rules. Immutable ring snapshots, bounded peer
+batch assembly, and asynchronous queue ownership still require their copies.
+
+One routing stress comparison passed both versions: five-server/1,000-node routing
+was 7.640 s before and 8.010 s after; 64 sockets sharing one source were 78.2 ms and
+80.7 ms. These changes target drops, disconnects, and retained buffers; this single
+sample does not demonstrate an improvement to healthy routing throughput. Allocated
+bytes during the five-server run were 7,809.8 MiB before and 7,800.3 MiB after.
+Full race suite, vet, and static build passed, including replay, packet safety, and
+extra-field preservation tests. Benchmarks live in `tests/memory_bench_test.go`.
+Logs: `/tmp/wsrouter-memory-before.log`,
+`/tmp/wsrouter-memory-baseline-bench.log`, `/tmp/wsrouter-memory-after.log`.

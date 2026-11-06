@@ -1247,10 +1247,18 @@ func (cl *client) drop(p packet, original []byte, reason string) {
 	var fields map[string]json.RawMessage
 	json.Unmarshal(original, &fields)
 	p.Type, p.Payload = "drop", reason
-	updated, _ := json.Marshal(p)
-	// Merge canonical fields while retaining any extra fields from the input.
-	json.Unmarshal(updated, &fields)
-	data, _ := json.Marshal(fields)
+	// Strip canonical fields from extras, then combine two encoded JSON objects.
+	// This avoids parsing the freshly encoded canonical packet back into a map.
+	for _, key := range []string{"_id", "timestamp", "type", "dest_node_id", "dest_node_ids", "src_id", "src_node_id", "x_src_id", "payload"} {
+		delete(fields, key)
+	}
+	data, _ := json.Marshal(p)
+	if len(fields) != 0 {
+		extras, _ := json.Marshal(fields)
+		canonical := data
+		data = append(extras[:len(extras)-1], ',')
+		data = append(data, canonical[1:]...)
+	}
 	if len(data) > 1<<20 {
 		cl.close()
 		return
@@ -1540,7 +1548,7 @@ func (cl *client) close() {
 		delete(state.connections, cl)
 		cl.sent, cl.sentHead = pruneHistory(cl.sent, cl.sentHead, time.Now().Add(-cl.keepAlive))
 		if !cl.normalClose.Load() {
-			replay = append(replay, cl.sent[cl.sentHead:]...)
+			replay = cl.sent[cl.sentHead:]
 		}
 		cl.sent = nil
 		cl.sentHead = 0
@@ -1551,7 +1559,7 @@ func (cl *client) close() {
 				s.scheduleNodeCleanup(state, time.Now().Add(10*time.Second))
 			}
 			state.recent.prune(time.Now())
-			recent = append([]receipt(nil), state.recent.entries[state.recent.head:]...)
+			recent = state.recent.entries[state.recent.head:]
 			state.recent = receiptQueue{}
 			s.recent.CompareAndDelete(cl.nodeID, state)
 		}
@@ -1982,6 +1990,9 @@ func (link *peerLink) readLoop() {
 	link.conn.SetPongHandler(func(string) error { return link.conn.SetReadDeadline(time.Now().Add(13 * time.Second)) })
 	var buffer bytes.Buffer
 	for {
+		if buffer.Cap() > 64<<10 {
+			buffer = bytes.Buffer{}
+		}
 		kind, reader, err := link.conn.NextReader()
 		if err != nil || kind != websocket.TextMessage {
 			return
@@ -2087,6 +2098,9 @@ func (link *peerLink) writeLoop() {
 		if err := link.conn.WriteMessage(kind, data); err != nil {
 			return
 		}
+		if cap(batchBuffer) > 64<<10 {
+			batchBuffer = nil
+		}
 	}
 }
 
@@ -2117,7 +2131,7 @@ func (link *peerLink) close() {
 		s.peerMu.Unlock()
 		link.mu.Lock()
 		link.history, link.head = pruneHistory(link.history, link.head, time.Now().Add(-3*time.Second))
-		replay := append([]replayRecord(nil), link.history[link.head:]...)
+		replay := link.history[link.head:]
 		link.history, link.head = nil, 0
 		link.data, link.feedback = frameQueue{}, frameQueue{}
 		link.mu.Unlock()
